@@ -31,7 +31,7 @@ class LiveCaptionReader : AccessibilityService() {
         private const val TRANSLATE_URL   = "http://127.0.0.1:8765/translate_text"
         private const val CONNECT_TIMEOUT = 2_000
         private const val READ_TIMEOUT    = 12_000
-        private const val DEBOUNCE_MS     = 400L
+        private const val DEBOUNCE_MS     = 2000L  // 2s lag — lets Live Captions finish correcting
 
         @Volatile var isRunning       = false
         @Volatile var lastCaptionText = ""
@@ -68,10 +68,10 @@ class LiveCaptionReader : AccessibilityService() {
 
         startTranslateWorker()
         // Clear cached state from previous session
-        lastSentText       = ""
-        lastHindiOut       = ""
-        lastCaptionText    = ""
-        previousWindowText = ""
+        lastSentText            = ""
+        lastHindiOut            = ""
+        lastCaptionText         = ""
+        lastTranslatedSentence  = ""
         SpeechCaptureService.latestHindi   = ""
         SpeechCaptureService.latestEnglish = ""
         Log.i(TAG, "LiveCaptionReader v6 connected")
@@ -94,7 +94,7 @@ class LiveCaptionReader : AccessibilityService() {
         scheduleTranslation(captionText)
     }
 
-    private var previousWindowText = ""  // tracks previous full text of caption window
+    private var lastTranslatedSentence = ""
 
     private fun readFromCaptionWindow(): String? {
         val allWindows = try { windows } catch (_: Exception) { return null }
@@ -115,14 +115,18 @@ class LiveCaptionReader : AccessibilityService() {
 
                 if (validTexts.isEmpty()) return null
 
-                // Find the NEWEST text — text that wasn't in the previous reading
-                // Live Captions accumulates text; we want only what just changed
-                val currentFullText = validTexts.joinToString(" ")
+                // Get the full accumulated text from Live Captions window
+                val fullText = validTexts.maxByOrNull { it.length } ?: return null
 
-                val newText = findNewContent(previousWindowText, currentFullText)
-                previousWindowText = currentFullText
+                // Split by sentence boundaries and take the LAST complete sentence
+                val lastSentence = extractLastSentence(fullText) ?: return null
 
-                return if (newText.isNotBlank() && isValidCaption(newText)) newText else null
+                // Only translate if it's new and long enough to be meaningful
+                if (lastSentence == lastTranslatedSentence) return null
+                if (lastSentence.length < 4) return null
+
+                lastTranslatedSentence = lastSentence
+                return lastSentence
             } else {
                 root.recycle()
             }
@@ -130,34 +134,23 @@ class LiveCaptionReader : AccessibilityService() {
         return null
     }
 
-    private fun findNewContent(previous: String, current: String): String {
-        if (previous.isBlank()) return current.trim()
-        if (current == previous) return ""
+    private fun extractLastSentence(text: String): String? {
+        // Split on Japanese/English sentence endings
+        val sentences = text
+            .split(Regex("[。！？!?]+"))
+            .map { it.trim() }
+            .filter { it.length >= 4 }
 
-        // Find what was added to the end (Live Captions appends to existing text)
-        if (current.startsWith(previous)) {
-            return current.removePrefix(previous).trim()
+        if (sentences.isEmpty()) {
+            // No sentence boundaries — return full text if reasonable length
+            return if (text.trim().length >= 4) text.trim() else null
         }
 
-        // Text completely changed (new sentence started)
-        // Find the longest suffix of current that is NOT in previous
-        val currentWords = current.split(" ")
-        val previousWords = previous.split(" ").toSet()
-
-        // Find where new content starts from the end
-        var newStart = currentWords.size
-        for (i in currentWords.indices.reversed()) {
-            if (currentWords[i] in previousWords) {
-                newStart = i + 1
-                break
-            }
-            if (i < currentWords.size - 8) break // don't look back more than 8 words
-        }
-
-        val newWords = currentWords.drop(newStart)
-        return if (newWords.isNotEmpty()) newWords.joinToString(" ").trim()
-        else current.trim() // completely new content
+        // Return last complete sentence
+        return sentences.lastOrNull()
     }
+
+    private fun findNewContent(previous: String, current: String): String = current
 
     private fun collectAllText(node: AccessibilityNodeInfo?, out: MutableList<String>) {
         node ?: return
@@ -187,17 +180,24 @@ class LiveCaptionReader : AccessibilityService() {
         if (text.contains("com.android") || text.contains("com.google")) return false
         // Reject locale strings like "English (United States)"
         if (text.matches(Regex(".*\\(.*\\).*")) && text.length < 50) return false
+        // Reject very short English fragments (single/double words) — UI noise
+        val isAllAscii = text.all { it.isAscii() }
+        if (isAllAscii && text.split(" ").size <= 2 && text.length < 15) return false
         return true
     }
 
     private fun scheduleTranslation(text: String) {
+        // Cancel previous timer — restart 2s countdown on every new word from Live Captions
+        // Timer only fires when Live Captions stops updating (sentence complete + corrected)
         pendingJob?.cancel()
         pendingJob = scope.launch {
             delay(DEBOUNCE_MS)
-            if (text == lastCaptionText && text != lastSentText) {
-                lastSentText = text
+            // Read the caption window AGAIN after 2s — get the fully corrected text
+            val finalText = readFromCaptionWindow() ?: lastCaptionText
+            if (finalText.isNotBlank() && finalText != lastSentText) {
+                lastSentText = finalText
                 if (translateQueue.size >= 8) translateQueue.poll()
-                translateQueue.offer(text)
+                translateQueue.offer(finalText)
             }
         }
     }
