@@ -12,10 +12,15 @@ import java.net.URL
 import java.util.concurrent.LinkedBlockingQueue
 
 /**
- * LiveCaptionReader v6 — KEY FIX: use windows list, NOT rootInActiveWindow
+ * LiveCaptionReader — continuously reads Live Captions overlay and
+ * translates to Hindi via whisper_server.py CT2 pipeline.
  *
- * rootInActiveWindow returns the FOCUSED window (Termux, browser etc.)
- * We must iterate windows list and find the com.google.android.as window specifically.
+ * Two read paths run in parallel:
+ *  1. onAccessibilityEvent — event-driven, fires on UI changes (fast)
+ *  2. Watchdog poller      — active poll every 1.5s regardless of events (resilient)
+ *
+ * This guarantees translation never stops as long as Live Captions is visible,
+ * even if Android throttles accessibility events during heavy CPU load.
  */
 class LiveCaptionReader : AccessibilityService() {
 
@@ -31,30 +36,36 @@ class LiveCaptionReader : AccessibilityService() {
         private const val TRANSLATE_URL   = "http://127.0.0.1:8765/translate_text"
         private const val CONNECT_TIMEOUT = 2_000
         private const val READ_TIMEOUT    = 12_000
-
-        // 500ms debounce — short enough to catch rapid dialogue,
-        // long enough for Live Captions to finish word-correction on each line
         private const val DEBOUNCE_MS     = 500L
-
-        // Force-send after this long even if Live Captions keeps updating
-        // Prevents infinite deferral during fast continuous speech
         private const val MAX_WAIT_MS     = 3_000L
 
-        @Volatile var isRunning  = false
+        // Watchdog polls Live Captions window directly at this interval.
+        // Catches updates missed when Android throttles accessibility events.
+        private const val WATCHDOG_MS     = 1_500L
+
+        @Volatile var isRunning = false
         @Volatile var instance: LiveCaptionReader? = null
     }
 
-    private val scope         = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var pendingJob:    Job? = null
-    private var forceJob:      Job? = null   // fires after MAX_WAIT_MS regardless of updates
-    private var translateJob:  Job? = null
-    private var lastSentText   = ""
-    private var lastHindiOut   = ""
-    private var lastDetectedLang = ""        // track language switches
-    // Unbounded FIFO queue — every translated sentence must reach the overlay.
-    // Never drop, never clear. CT2 works through the backlog at its own pace;
-    // the overlay holds each 2-line block visible until the next one is ready.
+    private val scope          = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var pendingJob:      Job? = null
+    private var forceJob:        Job? = null
+    private var translateJob:    Job? = null
+    private var watchdogJob:     Job? = null
+    private var lastSentText     = ""
+    private var lastHindiOut     = ""
+    private var lastDetectedLang = ""
+
+    // Unbounded FIFO — every sentence reaches the overlay, never dropped
     private val translateQueue = LinkedBlockingQueue<String>()
+
+    // Window reader state
+    private var lastTranslatedSentence = ""
+    private var lastRawCaption         = ""
+    private var lastSentText2          = ""
+    private var captionWasVisible      = false
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -73,53 +84,70 @@ class LiveCaptionReader : AccessibilityService() {
                 AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                 AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
             )
-            // Do NOT set packageNames — we need events from ALL packages
-            // (video player, browser etc.) because TYPE_WINDOWS_CHANGED fires
-            // with the foreground app's package, not com.google.android.as
-            info.packageNames = null
+            info.packageNames = null  // receive events from ALL packages
         }
 
+        resetState()
         startTranslateWorker()
-        // Clear cached state from previous session
-        lastSentText            = ""
-        lastHindiOut            = ""
-        lastTranslatedSentence  = ""
-        lastDetectedLang        = ""
-        lastRawCaption          = ""
-        lastSentText2           = ""
-        captionWasVisible       = false
-        SpeechCaptureService.latestHindi   = ""
-        SpeechCaptureService.latestEnglish = ""
-        Log.i(TAG, "LiveCaptionReader v6 connected")
+        startWatchdog()
+        Log.i(TAG, "LiveCaptionReader connected — event + watchdog active")
         scope.launch(Dispatchers.Main) {
             MainActivity.instance?.onLiveCaptionReaderConnected()
         }
     }
 
+    override fun onInterrupt() { Log.w(TAG, "Interrupted") }
+
+    override fun onDestroy() {
+        isRunning = false
+        instance  = null
+        pendingJob?.cancel()
+        forceJob?.cancel()
+        watchdogJob?.cancel()
+        translateJob?.cancel()
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    // ── Event-driven read path ────────────────────────────────────────────────
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (!isRunning || event == null) return
-
-        // CRITICAL: Do NOT filter by event.packageName here.
-        // TYPE_WINDOWS_CHANGED fires with the foreground app's package (video player),
-        // not com.google.android.as — filtering by package causes us to miss most events.
-        // We scan the windows list ourselves inside readFromCaptionWindow() to find
-        // the Live Captions window regardless of which package triggered the event.
+        // No package filter — TYPE_WINDOWS_CHANGED fires with foreground app pkg
         val sendText = readFromCaptionWindow() ?: return
-        Log.d(TAG, "Caption: $sendText")
+        Log.d(TAG, "Event→ ${sendText.take(60)}")
         scheduleTranslation(sendText)
     }
 
-    private var lastTranslatedSentence = ""
+    // ── Watchdog read path ────────────────────────────────────────────────────
 
-    private var lastRawCaption    = ""
-    private var lastSentText2     = ""
-    private var captionWasVisible = false
+    /**
+     * Polls the Live Captions window every WATCHDOG_MS regardless of events.
+     * Recovers from Android event throttling, CPU spikes, or any gap where
+     * onAccessibilityEvent stops firing while Live Captions is still running.
+     */
+    private fun startWatchdog() {
+        watchdogJob = scope.launch {
+            Log.i(TAG, "Watchdog started — polling every ${WATCHDOG_MS}ms")
+            while (isActive && isRunning) {
+                delay(WATCHDOG_MS)
+                val sendText = withContext(Dispatchers.Main) {
+                    try { readFromCaptionWindow() } catch (_: Exception) { null }
+                } ?: continue
+                Log.d(TAG, "Watchdog→ ${sendText.take(60)}")
+                scheduleTranslation(sendText)
+            }
+            Log.i(TAG, "Watchdog stopped")
+        }
+    }
+
+    // ── Window reader ─────────────────────────────────────────────────────────
 
     private fun readFromCaptionWindow(): String? {
         val allWindows = try { windows } catch (_: Exception) { return null }
 
-        // Find Live Captions window
-        var captionRoot: android.view.accessibility.AccessibilityNodeInfo? = null
+        // Find the Live Captions window
+        var captionRoot: AccessibilityNodeInfo? = null
         if (!allWindows.isNullOrEmpty()) {
             for (window in allWindows) {
                 val root = try { window.root } catch (_: Exception) { continue } ?: continue
@@ -130,29 +158,29 @@ class LiveCaptionReader : AccessibilityService() {
             }
         }
 
-        // Window gone → silence → reset everything
+        // Window not visible → silence → reset state
         if (captionRoot == null) {
             if (captionWasVisible) {
                 captionWasVisible = false
                 lastRawCaption    = ""
                 lastSentText2     = ""
-                Log.d(TAG, "LC gone — reset")
+                Log.d(TAG, "LC gone — state reset")
             }
             return null
         }
 
-        // Collect text
+        // Collect all text nodes
         val nodes = mutableListOf<String>()
         collectAllText(captionRoot, nodes)
         captionRoot.recycle()
 
         val fullText = nodes
-            .filter { isValidCaption(it) }
-            .filter { !isStaticUiLabel(it) }
+            .filter  { isValidCaption(it) }
+            .filter  { !isStaticUiLabel(it) }
             .maxByOrNull { it.length }
             ?.trim() ?: return null
 
-        // Fresh session after silence
+        // Fresh session — LC window reappeared after silence
         if (!captionWasVisible) {
             captionWasVisible = true
             lastRawCaption    = ""
@@ -160,60 +188,29 @@ class LiveCaptionReader : AccessibilityService() {
             Log.d(TAG, "LC appeared — fresh session")
         }
 
-        // No raw change at all
+        // No raw change since last read
         if (fullText == lastRawCaption) return null
+
+        // Extract only the new suffix appended since last read
+        val prevFull   = lastSentText2
         lastRawCaption = fullText
 
-        // Extract the genuinely NEW portion since last read.
-        // Live Captions appends within a session — new content is always a suffix.
-        val newPart: String
-        if (fullText.startsWith(lastSentText2) && lastSentText2.isNotEmpty()) {
-            // Pure append — extract only what's new
-            newPart = fullText.substring(lastSentText2.length).trim()
-        } else {
-            // LC corrected earlier words or reset — send last ~150 chars for context
-            newPart = fullText.takeLast(150).trim()
-        }
+        val newPart: String = if (prevFull.isNotEmpty() && fullText.startsWith(prevFull))
+            fullText.substring(prevFull.length).trim()   // pure append — exact new suffix
+        else
+            fullText.takeLast(150).trim()                // correction/reset — send tail for context
+
+        lastSentText2 = fullText
 
         if (newPart.length < 3) return null
-        if (newPart == lastSentText2) return null
-        lastSentText2 = fullText  // track full text, not just tail
         return newPart
     }
 
-
-    private fun collectAllText(node: AccessibilityNodeInfo?, out: MutableList<String>) {
-        node ?: return
-        val text = node.text?.toString()?.trim() ?: ""
-        if (text.isNotBlank()) out.add(text)
-        for (i in 0 until node.childCount) collectAllText(node.getChild(i), out)
-    }
-
-    private fun isStaticUiLabel(text: String): Boolean {
-        val lower = text.lowercase()
-        // Drop Live Captions UI locale strings e.g. "English (United States)"
-        // These always match the pattern: "Word (Word)" and are short
-        if (text.matches(Regex("[A-Za-zÀ-ÿ ]+\\([A-Za-zÀ-ÿ ]+\\)")) && text.length < 60) return true
-        if (lower.contains("united states") || lower.contains("united kingdom")) return true
-        if (lower.contains("simplified") || lower.contains("traditional")) return true
-        // Drop single words with no space — Live Captions UI buttons, not captions
-        if (!text.contains(" ") && text.length < 15) return true
-        return false
-    }
-
-    private fun isValidCaption(text: String): Boolean {
-        if (text.length < 3 || text.length > 400) return false
-        val letters = text.count { it.isLetter() }
-        if (letters < text.length * 0.35) return false
-        if (text.contains("http") || text.contains("www.")) return false
-        if (text.contains("com.android") || text.contains("com.google")) return false
-        // Reject locale strings like "English (United States)"
-        if (text.matches(Regex(".*\\(.*\\).*")) && text.length < 50) return false
-        return true
-    }
+    // ── Scheduling ────────────────────────────────────────────────────────────
 
     private fun scheduleTranslation(sendText: String) {
-        // Detect language switch from the send text script
+        // Detect language script switch — reset dedup state so first line of
+        // new language is never blocked by state from the previous language
         val scriptNow = detectScript(sendText)
         if (scriptNow != lastDetectedLang && lastDetectedLang.isNotEmpty()) {
             lastSentText           = ""
@@ -225,21 +222,20 @@ class LiveCaptionReader : AccessibilityService() {
         }
         lastDetectedLang = scriptNow
 
-        // Debounce: cancel and restart 500ms timer.
+        // Debounce: 500ms wait lets LC finish word-correction on current line
         pendingJob?.cancel()
         pendingJob = scope.launch {
             delay(DEBOUNCE_MS)
-            val toSend = lastSentText2.ifBlank { sendText }
-            enqueueForTranslation(toSend)
+            enqueueForTranslation(lastSentText2.ifBlank { sendText })
         }
 
-        // Force-send: guarantee output every MAX_WAIT_MS during continuous speech.
+        // Force-send: if speech is continuous and debounce keeps getting
+        // cancelled, guarantee a send every MAX_WAIT_MS anyway
         if (forceJob == null || forceJob?.isActive == false) {
             forceJob = scope.launch {
                 delay(MAX_WAIT_MS)
                 pendingJob?.cancel()
-                val toSend = lastSentText2.ifBlank { sendText }
-                enqueueForTranslation(toSend)
+                enqueueForTranslation(lastSentText2.ifBlank { sendText })
             }
         }
     }
@@ -249,26 +245,10 @@ class LiveCaptionReader : AccessibilityService() {
         forceJob = null
         if (text.isBlank() || text == lastSentText) return
         lastSentText = text
-        // FIFO — just add. Never drop, never clear.
-        // Overlay holds each block until next one arrives.
-        translateQueue.offer(text)
+        translateQueue.offer(text)   // FIFO — always add, never drop
     }
 
-    /** Coarse script detection for language-switch tracking only. */
-    private fun detectScript(text: String): String {
-        for (c in text) {
-            val cp = ord(c)
-            if (cp in 0x3040..0x30FF) return "ja"
-            if (cp in 0x4E00..0x9FFF) return "zh"
-            if (cp in 0xAC00..0xD7AF) return "ko"
-            if (cp in 0x0600..0x06FF) return "ar"
-            if (cp in 0x0400..0x04FF) return "ru"
-            if (cp in 0x0900..0x097F) return "hi"
-        }
-        return "latin"
-    }
-
-    private fun ord(c: Char) = c.code
+    // ── Translation worker ────────────────────────────────────────────────────
 
     private fun startTranslateWorker() {
         translateJob = scope.launch {
@@ -280,8 +260,6 @@ class LiveCaptionReader : AccessibilityService() {
 
                 val hindi = translate(text) ?: continue
                 if (hindi.isBlank()) continue
-                // Don't block on lastHindiOut equality — short repeated lines
-                // (e.g. "हाँ।" "ठीक है।") are valid subtitles in rapid dialogue
 
                 Log.i(TAG, "✓ ${text.take(40)} → ${hindi.take(40)}")
                 SpeechCaptureService.latestHindi   = hindi
@@ -317,12 +295,56 @@ class LiveCaptionReader : AccessibilityService() {
         }
     }
 
-    override fun onInterrupt() { Log.w(TAG, "Interrupted") }
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-    override fun onDestroy() {
-        isRunning = false; instance = null
-        pendingJob?.cancel(); forceJob?.cancel()
-        translateJob?.cancel(); scope.cancel()
-        super.onDestroy()
+    private fun resetState() {
+        lastSentText            = ""
+        lastHindiOut            = ""
+        lastTranslatedSentence  = ""
+        lastDetectedLang        = ""
+        lastRawCaption          = ""
+        lastSentText2           = ""
+        captionWasVisible       = false
+        SpeechCaptureService.latestHindi   = ""
+        SpeechCaptureService.latestEnglish = ""
+    }
+
+    private fun collectAllText(node: AccessibilityNodeInfo?, out: MutableList<String>) {
+        node ?: return
+        val text = node.text?.toString()?.trim() ?: ""
+        if (text.isNotBlank()) out.add(text)
+        for (i in 0 until node.childCount) collectAllText(node.getChild(i), out)
+    }
+
+    private fun isStaticUiLabel(text: String): Boolean {
+        val lower = text.lowercase()
+        if (text.matches(Regex("[A-Za-zÀ-ÿ ]+\\([A-Za-zÀ-ÿ ]+\\)")) && text.length < 60) return true
+        if (lower.contains("united states") || lower.contains("united kingdom")) return true
+        if (lower.contains("simplified") || lower.contains("traditional")) return true
+        if (!text.contains(" ") && text.length < 15) return true
+        return false
+    }
+
+    private fun isValidCaption(text: String): Boolean {
+        if (text.length < 3 || text.length > 400) return false
+        val letters = text.count { it.isLetter() }
+        if (letters < text.length * 0.35) return false
+        if (text.contains("http") || text.contains("www.")) return false
+        if (text.contains("com.android") || text.contains("com.google")) return false
+        if (text.matches(Regex(".*\\(.*\\).*")) && text.length < 50) return false
+        return true
+    }
+
+    private fun detectScript(text: String): String {
+        for (c in text) {
+            val cp = c.code
+            if (cp in 0x3040..0x30FF) return "ja"
+            if (cp in 0x4E00..0x9FFF) return "zh"
+            if (cp in 0xAC00..0xD7AF) return "ko"
+            if (cp in 0x0600..0x06FF) return "ar"
+            if (cp in 0x0400..0x04FF) return "ru"
+            if (cp in 0x0900..0x097F) return "hi"
+        }
+        return "latin"
     }
 }
