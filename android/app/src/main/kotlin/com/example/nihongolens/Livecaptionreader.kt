@@ -259,11 +259,19 @@ class LiveCaptionReader : AccessibilityService() {
 
         lastSentText2 = fullText
 
-        if (newPart.length < 3) {
+        // Minimum new content threshold — CJK: 1 char (each char = 1 word)
+        // Latin: 4 chars (need at least a short word to be meaningful)
+        val isCjk = newPart.any { it.code in 0x3000..0x9FFF || it.code in 0xAC00..0xD7AF }
+        val minNew = if (isCjk) 1 else 4
+        if (newPart.length < minNew) {
             CaptionLogger.log(TAG, "newPart too short (${newPart.length}): '${newPart}'")
             return null
         }
-        return newPart
+
+        // Return last 150 chars of full accumulated text — gives CT2 complete
+        // sentence context rather than a raw 1-2 char suffix
+        val toReturn = if (fullText.length > 150) fullText.takeLast(150).trim() else fullText.trim()
+        return toReturn
     }
 
     // ── Scheduling ────────────────────────────────────────────────────────────
@@ -313,24 +321,10 @@ class LiveCaptionReader : AccessibilityService() {
         forceJob = null
         if (text.isBlank()) return
 
-        // Normalize before dedup check — catches near-duplicates where only
-        // trailing whitespace or punctuation differs
         val norm = normalize(text)
         if (norm == lastEnqueuedNorm) {
             CaptionLogger.log(TAG, "enqueue SKIP duplicate: '${text.take(50)}'")
             return
-        }
-
-        // Also check if this is just a short suffix of what we already sent
-        // (LC appended 1-2 words — not enough new content to re-translate)
-        if (norm.length > 20 && lastEnqueuedNorm.isNotEmpty() &&
-            norm.startsWith(lastEnqueuedNorm.take(lastEnqueuedNorm.length.coerceAtMost(norm.length - 8)))) {
-            val newChars = norm.length - lastEnqueuedNorm.length
-            if (newChars in 1..15) {
-                // Only 1-15 new chars — not worth re-translating entire sentence
-                CaptionLogger.log(TAG, "enqueue SKIP minor append (+${newChars}ch): '${text.takeLast(20)}'")
-                return
-            }
         }
 
         lastEnqueuedNorm = norm
