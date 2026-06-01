@@ -104,10 +104,16 @@ class OverlayService : Service() {
     private fun onNewText(hindi: String) {
         if (hindi.isBlank()) return
 
-        // Add to FIFO queue — never drop
-        displayQueue.addLast(hindi.trim())
+        val trimmed = hindi.trim()
+        // Don't add exact duplicate of what's currently showing if queue is empty
+        if (trimmed == currentText && displayQueue.isEmpty()) {
+            rescheduleSilence(); return
+        }
 
-        // If nothing showing, show immediately
+        // Add to FIFO queue — never drop
+        displayQueue.addLast(trimmed)
+
+        // Only kick display if not already showing — prevents multiple timers stacking
         if (!isShowing) showNext()
 
         rescheduleSilence()
@@ -115,30 +121,31 @@ class OverlayService : Service() {
 
     // Show the next item from the queue
     private fun showNext() {
+        // Cancel any pending read timer first — only one timer at a time
+        readRunnable?.let { mainHandler.removeCallbacks(it) }
+        readRunnable = null
+
         if (displayQueue.isEmpty()) {
-            // Nothing more — keep current text visible, wait for silence
+            // Nothing more — stay on current text until silence timer fires
             return
         }
 
         val text = displayQueue.removeFirst()
-        if (text == currentText && displayQueue.isEmpty()) {
-            // Exact same text and nothing more — skip duplicate, stay on screen
-            return
-        }
-
         currentText = text
         isShowing   = true
         showText(text, animate = true)
 
-        // Schedule advancing to next item after READ_MS
-        // If queue is building up (3+ items waiting), advance after half time
-        // so we don't fall too far behind the speech
-        readRunnable?.let { mainHandler.removeCallbacks(it) }
-        readRunnable = Runnable {
-            if (!running) return@Runnable
-            if (displayQueue.isNotEmpty()) showNext()
-        }
+        // Schedule advance to next after READ_MS
+        // If backlog building (3+ waiting), use half time to catch up
         val waitMs = if (displayQueue.size >= 3) READ_MS / 2 else READ_MS
+        readRunnable = Runnable {
+            readRunnable = null
+            if (!running) return@Runnable
+            if (displayQueue.isNotEmpty()) {
+                showNext()
+            }
+            // else: stay on current text, silence timer will clear eventually
+        }
         mainHandler.postDelayed(readRunnable!!, waitMs)
     }
 
@@ -177,9 +184,12 @@ class OverlayService : Service() {
         silenceRunnable?.let { mainHandler.removeCallbacks(it) }
         silenceRunnable = Runnable {
             if (!running) return@Runnable
-            readRunnable?.let { mainHandler.removeCallbacks(it) }
-            displayQueue.clear()
-            fadeOut()
+            // Only clear if no new content arrived while we were waiting
+            if (displayQueue.isEmpty()) {
+                readRunnable?.let { mainHandler.removeCallbacks(it) }
+                readRunnable = null
+                fadeOut()
+            }
         }
         mainHandler.postDelayed(silenceRunnable!!, SILENCE_MS)
     }
