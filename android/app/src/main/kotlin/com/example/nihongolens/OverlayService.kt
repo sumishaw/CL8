@@ -142,10 +142,10 @@ class OverlayService : Service() {
      */
     private fun onClearQueue() {
         val dropped = queue.size
-        // Set expectedToken to one past the highest issued token
         expectedToken = tokenCounter.get() + 1
         queue.clear()
         cancelTimer()
+        showing = false
         android.util.Log.d("OverlayService", "clearQueue: dropped=$dropped expectedToken=$expectedToken")
     }
 
@@ -164,24 +164,26 @@ class OverlayService : Service() {
             queue.removeFirst()
         }
 
-        if (queue.isEmpty()) return  // nothing to show, stay on current until silence
+        if (queue.isEmpty()) {
+            // Nothing queued — mark idle so next onNewHindi() kicks display
+            showing = false
+            return
+        }
 
         val item = queue.removeFirst()
-        if (item.token < expectedToken) return  // double-check after removal
+        if (item.token < expectedToken) { showing = false; return }
 
         currentText = item.text
         showing     = true
         display(item.text)
 
-        // Schedule next advance with this item's token
         val capturedToken = item.token
         timerToken        = capturedToken
         val waitMs        = if (queue.size >= 3) READ_MS_BACKLOG else READ_MS_NORMAL
         readRunnable = Runnable {
             readRunnable = null
             if (!running) return@Runnable
-            // Stale timer check: if expectedToken advanced past our token, discard
-            if (capturedToken < expectedToken) return@Runnable
+            if (capturedToken < expectedToken) { showing = false; return@Runnable }
             advance()
         }
         handler.postDelayed(readRunnable!!, waitMs)
