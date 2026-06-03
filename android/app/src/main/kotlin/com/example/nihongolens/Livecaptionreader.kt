@@ -183,6 +183,7 @@ class LiveCaptionReader : AccessibilityService() {
             if (lcVisible) {
                 lcVisible = false; lastRaw = ""; lastFull = ""
                 lastNorm = ""; lastSentText = ""
+                lastHindiOut = ""; lastHindiTime = 0L
                 val dropped = queue.size
                 queue.clear()
                 expectedSeq = seqCounter.get() + 1
@@ -257,19 +258,23 @@ class LiveCaptionReader : AccessibilityService() {
         }
     }
 
+    // Track last successful translation output to block duplicate results
+    private var lastHindiOut     = ""
+    private var lastHindiTime    = 0L
+    private val HINDI_DEDUP_MS   = 3_000L  // don't show same Hindi within 3s
+
     private fun enqueue(text: String) {
         forceJob?.cancel(); forceJob = null
         if (text.isBlank()) return
 
         val n = norm(text)
 
-        // Tail-based dedup: compare last 80 chars — LC accumulates text,
-        // so full-text comparison produces hundreds of near-duplicate enqueues
+        // Tail-based dedup: compare last 80 chars
         val tail     = if (n.length > 80) n.takeLast(80) else n
         val lastTail = if (lastNorm.length > 80) lastNorm.takeLast(80) else lastNorm
         if (tail == lastTail) return
 
-        // Skip minor extensions (< 8 new chars on long text)
+        // Skip minor extensions (< 8 new chars)
         if (lastNorm.isNotEmpty() && n.length > lastNorm.length) {
             val added = n.length - lastNorm.length
             if (added < 8 && n.startsWith(lastNorm.take(lastNorm.length.coerceAtMost(n.length - 4))))
@@ -280,9 +285,7 @@ class LiveCaptionReader : AccessibilityService() {
         lastSentText = text
         val seq      = seqCounter.incrementAndGet()
 
-        // Cap queue — drop oldest if backlogged to keep translations current
         while (queue.size >= QUEUE_CAP) queue.poll()
-
         queue.offer(Pair(seq, text))
         enqCount.incrementAndGet()
         CaptionLogger.log(TAG, "ENQ seq=$seq q=${queue.size} '${text.take(60)}'")
@@ -317,6 +320,17 @@ class LiveCaptionReader : AccessibilityService() {
                     if (norm(text) == lastNorm) lastNorm = ""
                     continue
                 }
+
+                // Dedup Hindi output — profanity sentences often produce the same
+                // Hindi result from slightly different LC accumulated text
+                val hindiNorm = norm(hindi)
+                val now = System.currentTimeMillis()
+                if (hindiNorm == norm(lastHindiOut) && (now - lastHindiTime) < HINDI_DEDUP_MS) {
+                    CaptionLogger.log(TAG, "SKIP same Hindi within ${HINDI_DEDUP_MS}ms")
+                    continue
+                }
+                lastHindiOut  = hindi
+                lastHindiTime = now
 
                 okCount.incrementAndGet()
                 CaptionLogger.log(TAG, "OK seq=$seq ${ms}ms '${hindi.take(50)}'")
@@ -357,6 +371,7 @@ class LiveCaptionReader : AccessibilityService() {
         lastNorm = ""; lastSentText = ""; confirmedLang = ""
         pendingLang = ""; pendingCount = 0
         lastRaw = ""; lastFull = ""; lcVisible = false; expectedSeq = 0L
+        lastHindiOut = ""; lastHindiTime = 0L
         SpeechCaptureService.latestHindi    = ""
         SpeechCaptureService.latestEnglish  = ""
         SpeechCaptureService.latestOriginal = ""
