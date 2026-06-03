@@ -29,7 +29,7 @@ class LiveCaptionReader : AccessibilityService() {
         private const val TAG              = "LCReader"
         private const val TRANSLATE_URL    = "http://127.0.0.1:8765/translate_text"
         private const val CONNECT_TIMEOUT  = 3_000
-        private const val READ_TIMEOUT     = 20_000
+        private const val READ_TIMEOUT     = 35_000  // LibreTranslate can take 10-15s on tablet CPU
         private const val DEBOUNCE_MS      = 250L
         private const val MAX_WAIT_MS      = 1_500L
         private const val WATCHDOG_MS      = 1_500L
