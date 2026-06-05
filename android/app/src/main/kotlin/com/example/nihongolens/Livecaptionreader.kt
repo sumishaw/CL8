@@ -235,7 +235,7 @@ class LiveCaptionReader : AccessibilityService() {
         val isCjk = newPart.any { it.code in 0x3000..0x9FFF || it.code in 0xAC00..0xD7AF }
         if (newPart.length < if (isCjk) 1 else 4) return null
 
-        return if (full.length > 120) full.takeLast(120).trim() else full.trim()
+        return if (full.length > 200) full.takeLast(200).trim() else full.trim()
     }
 
     // ── Scheduling ────────────────────────────────────────────────────────────
@@ -293,10 +293,17 @@ class LiveCaptionReader : AccessibilityService() {
         val isAppend = lastEnqueuedFull.isNotEmpty() &&
             n.length > lastEnqueuedFull.length &&
             n.startsWith(lastEnqueuedFull.take(lastEnqueuedFull.length.coerceAtMost(n.length - 5)))
-        if (isAppend && (n.length - lastEnqueuedFull.length) < MIN_GROW_CHARS) {
-            CaptionLogger.log(TAG, "SKIP grow +${n.length - lastEnqueuedFull.length}ch")
-            forceJob?.cancel(); forceJob = null   // don't retry same minor-grow
-            return
+        if (isAppend) {
+            val newChars = n.length - lastEnqueuedFull.length
+            // CJK: each char is a word — 6 new chars = ~2 new words, worth translating
+            // Latin: 15 new chars = ~3 new words
+            val isCjk = n.any { it.code in 0x3000..0x9FFF || it.code in 0xAC00..0xD7AF }
+            val minNew = if (isCjk) 6 else MIN_GROW_CHARS
+            if (newChars < minNew) {
+                CaptionLogger.log(TAG, "SKIP grow +${newChars}ch")
+                forceJob?.cancel(); forceJob = null
+                return
+            }
         }
 
         lastNorm         = n
