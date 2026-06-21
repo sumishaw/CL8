@@ -50,8 +50,10 @@ object HindiTtsService {
     enum class Gender  { AUTO, MALE, FEMALE }
     enum class Emotion { NEUTRAL, HAPPY, SAD, ANGRY, EXCITED, CURIOUS }
 
-    @Volatile var enabled        = false
-    @Volatile var selectedGender = Gender.AUTO
+    // Use JvmField to suppress auto-generated getter/setter
+    // which would clash with our explicit setEnabled/setGender functions
+    @JvmField @Volatile var enabled        = false
+    @JvmField @Volatile var selectedGender = Gender.AUTO
 
     @Volatile private var detectedGender = Gender.MALE
     @Volatile private var isSpeaking     = false
