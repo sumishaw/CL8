@@ -58,62 +58,73 @@ object HindiTtsService {
 
     private val scope        = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var pitchDetector: PitchDetector? = null
-    private var speakJob: Job? = null
+    private var workerJob:   Job? = null
+
+    // FIFO queue — holds pending TTS texts, max 3 (keep current)
+    private val ttsQueue = java.util.concurrent.LinkedBlockingQueue<Pair<String, Float>>(3)
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // ── Public API ────────────────────────────────────────────────────────────
 
     fun init(context: Context) {
-        pitchDetector = PitchDetector { gender ->
-            detectedGender = gender
-        }
+        pitchDetector = PitchDetector { gender -> detectedGender = gender }
+        startWorker()
     }
 
     fun setEnabled(on: Boolean) {
         enabled = on
         if (on && selectedGender == Gender.AUTO) pitchDetector?.start()
-        else if (!on) { pitchDetector?.stop(); stopCurrent() }
+        else if (!on) {
+            pitchDetector?.stop()
+            ttsQueue.clear()
+            stopMediaPlayer()
+        }
     }
 
     fun setGender(gender: Gender) {
         selectedGender = gender
-        when (gender) {
-            Gender.AUTO   -> pitchDetector?.start()
-            else          -> pitchDetector?.stop()
-        }
+        if (gender == Gender.AUTO) pitchDetector?.start() else pitchDetector?.stop()
     }
 
     fun speak(hindiText: String) {
         if (!enabled || hindiText.isBlank()) return
-        // Don't cancel previous job — let it finish naturally
-        // Only queue one at a time: if already speaking, skip (subtitle pace handles queuing)
-        if (isSpeaking) return
-
         val emotion    = detectEmotion(hindiText)
         val (speed, _) = emotionParams(emotion)
-
-        speakJob = scope.launch {
-            try {
-                isSpeaking = true
-                val wavBytes = requestTts(hindiText, 0, speed)
-                if (wavBytes != null && wavBytes.size > 44) {
-                    playWav(wavBytes)
-                } else {
-                    Log.w(TAG, "Empty TTS — is hindi_tts_server.py running on :8766?")
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "TTS speak error: ${e.message}")
-            } finally {
-                isSpeaking = false
-            }
-        }
+        // Drop oldest if queue full — keep audio current with subtitles
+        if (ttsQueue.size >= 3) ttsQueue.poll()
+        ttsQueue.offer(Pair(hindiText, speed))
     }
 
     fun destroy() {
         pitchDetector?.stop()
-        stopCurrent()
+        workerJob?.cancel()
+        ttsQueue.clear()
+        stopMediaPlayer()
         scope.cancel()
+    }
+
+    // ── Worker — processes queue sequentially ─────────────────────────────────
+
+    private fun startWorker() {
+        workerJob = scope.launch {
+            while (isActive) {
+                val (text, speed) = ttsQueue.poll(2, java.util.concurrent.TimeUnit.SECONDS)
+                    ?: continue
+                if (!enabled) continue
+                try {
+                    isSpeaking = true
+                    val wavBytes = requestTts(text, 0, speed)
+                    if (wavBytes != null && wavBytes.size > 44) {
+                        playWav(wavBytes)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Worker error: ${e.message}")
+                } finally {
+                    isSpeaking = false
+                }
+            }
+        }
     }
 
     // ── Emotion detection ─────────────────────────────────────────────────────
@@ -191,8 +202,26 @@ object HindiTtsService {
 
     private var mediaPlayer: android.media.MediaPlayer? = null
 
+    private fun stopMediaPlayer() {
+        mainHandler.post {
+            try { mediaPlayer?.stop() } catch (_: Exception) {}
+            try { mediaPlayer?.release() } catch (_: Exception) {}
+            mediaPlayer = null
+        }
+    }
+
     private suspend fun playWav(wavBytes: ByteArray) {
         val latch = java.util.concurrent.CountDownLatch(1)
+
+        // Determine pitch for gender
+        // Male=1.0 (natural), Female=1.3 (higher pitch), AUTO=detected
+        val effectiveGender = if (selectedGender == Gender.AUTO) detectedGender else selectedGender
+        val pitchShift = when (effectiveGender) {
+            Gender.FEMALE -> 1.30f
+            Gender.MALE   -> 1.00f
+            Gender.AUTO   -> if (detectedGender == Gender.FEMALE) 1.30f else 1.00f
+        }
+
         withContext(Dispatchers.Main) {
             try {
                 mediaPlayer?.let { try { it.release() } catch (_: Exception) {} }
@@ -215,7 +244,6 @@ object HindiTtsService {
                 }
 
                 mp.setOnCompletionListener {
-                    Log.d(TAG, "TTS playback complete")
                     try { it.release() } catch (_: Exception) {}
                     mediaPlayer = null
                     latch.countDown()
@@ -227,26 +255,31 @@ object HindiTtsService {
                     latch.countDown()
                     true
                 }
+
                 mp.prepare()
+
+                // Apply pitch for gender (Android 6+)
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                    mp.playbackParams = mp.playbackParams.setPitch(pitchShift)
+                }
+
                 mp.start()
                 mediaPlayer = mp
-                Log.d(TAG, "TTS started: ${mp.duration}ms")
+                Log.d(TAG, "TTS playing gender=$effectiveGender pitch=$pitchShift dur=${mp.duration}ms")
             } catch (e: Exception) {
                 Log.e(TAG, "playWav setup: ${e.message}")
                 latch.countDown()
             }
         }
-        // Block IO thread until playback completes (max 30s)
         withContext(Dispatchers.IO) {
             latch.await(30, java.util.concurrent.TimeUnit.SECONDS)
         }
     }
 
     fun stopCurrent() {
-        speakJob?.cancel(); speakJob = null; isSpeaking = false
-        try { mediaPlayer?.stop() } catch (_: Exception) {}
-        try { mediaPlayer?.release() } catch (_: Exception) {}
-        mediaPlayer = null
+        ttsQueue.clear()
+        stopMediaPlayer()
+        isSpeaking = false
     }
 }
 
