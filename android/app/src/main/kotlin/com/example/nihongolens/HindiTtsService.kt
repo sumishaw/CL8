@@ -163,23 +163,21 @@ object HindiTtsService {
     private fun emotionAndGenderParams(emotion: Emotion): Pair<Float, Float> {
         val gender = if (selectedGender == Gender.AUTO) detectedGender else selectedGender
 
-        // Base speed and pitch per emotion
         val (baseSpeed, basePitch) = when (emotion) {
-            Emotion.EXCITED -> Pair(1.10f, 1.08f)
-            Emotion.HAPPY   -> Pair(1.05f, 1.05f)
-            Emotion.CURIOUS -> Pair(0.95f, 1.02f)
-            Emotion.SAD     -> Pair(0.82f, 0.94f)
+            Emotion.EXCITED -> Pair(1.10f, 1.05f)
+            Emotion.HAPPY   -> Pair(1.05f, 1.03f)
+            Emotion.CURIOUS -> Pair(0.97f, 1.01f)
+            Emotion.SAD     -> Pair(0.82f, 0.96f)
             Emotion.ANGRY   -> Pair(1.08f, 1.00f)
-            Emotion.NEUTRAL -> Pair(1.05f, 1.00f)  // slightly faster base = keeps up with speech
+            Emotion.NEUTRAL -> Pair(1.05f, 1.00f)
         }
 
-        // Female: soft Indian women voice
-        //   pitch 1.08 = slightly higher but NOT harsh (1.3 was too harsh)
-        //   speed 0.90 = gentle, measured pace
-        //   The combination of moderate pitch + slower speed = natural Indian female
-        // Male: natural rohan voice with slight speed boost
+        // Female voice: pitch=0.80 = distinctly lower/softer than male 1.0
+        // This creates natural Indian women voice quality
+        // speed=0.92 = slightly measured pace, characteristic of soft female speech
+        // Male: natural at 1.0 pitch, slightly faster
         return when (gender) {
-            Gender.FEMALE -> Pair(baseSpeed * 0.90f, basePitch * 1.08f)
+            Gender.FEMALE -> Pair(baseSpeed * 0.92f, basePitch * 0.80f)
             else          -> Pair(baseSpeed * 1.02f, basePitch * 1.00f)
         }
     }
