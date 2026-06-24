@@ -9,6 +9,7 @@ import android.os.Build
 import android.util.Log
 import androidx.annotation.RequiresApi
 import kotlinx.coroutines.*
+import kotlinx.coroutines.currentCoroutineContext
 import kotlin.math.*
 
 /**
@@ -91,7 +92,7 @@ object GenderAnalyzer {
         val im   = FloatArray(N)
 
         try {
-            while (isActive) {
+            while (currentCoroutineContext().isActive) {
                 // Skip while TTS is playing — avoid detecting our own voice
                 if (HindiTtsService.isSuppressed()) {
                     delay(300); continue
