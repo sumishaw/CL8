@@ -49,15 +49,34 @@ class OverlayService : Service() {
 
         fun updateText(original: String, hindi: String) {
             latestOriginal = original; latestHindi = hindi
-            // Always push to overlay immediately — subtitle shows as soon as translated
-            // TTS plays when WAV is ready (may be 1-2s later due to Kokoro generation)
-            instance?.handler?.post { instance?.onNewHindi(hindi) }
+            // When TTS enabled: subtitle driven by TTS (showTtsText/clearTtsText)
+            // When TTS disabled: subtitle driven by holdMs timer
+            if (!HindiTtsService.enabled) {
+                instance?.handler?.post { instance?.onNewHindi(hindi) }
+            }
         }
 
-        // TTS calls these but overlay already manages display via updateText
-        // Kept for compatibility — no-op since overlay shows subtitle immediately
-        fun showTtsText(hindi: String) { /* overlay already shows via updateText */ }
-        fun clearTtsText() { /* overlay fades via silence timer */ }
+        // Called by HindiTtsService play worker when WAV starts playing
+        // Shows subtitle for exactly as long as TTS is speaking
+        fun showTtsText(hindi: String) {
+            instance?.handler?.post {
+                val tv = instance?.textView ?: return@post
+                tv.animate().cancel()
+                tv.alpha = 1f
+                tv.text  = hindi
+            }
+        }
+
+        // Called by HindiTtsService play worker when WAV finishes
+        fun clearTtsText() {
+            instance?.handler?.post {
+                instance?.textView?.animate()?.cancel()
+                instance?.textView?.animate()
+                    ?.alpha(0f)?.setDuration(300)
+                    ?.withEndAction { instance?.textView?.text = "" }
+                    ?.start()
+            }
+        }
         fun clearQueue() {
             instance?.handler?.post { instance?.onClear() }
         }
