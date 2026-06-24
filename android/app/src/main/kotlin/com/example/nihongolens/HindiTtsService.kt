@@ -149,8 +149,17 @@ object HindiTtsService {
     fun updateGenderFromSource(srcText: String, lang: String) {
         if (selectedGender != Gender.AUTO) return
         val t = srcText.lowercase()
-        val fScore = when (lang) {
-            "en" -> listOf(" she "," her "," mrs ","woman","girl","lady","mother","sister","daughter","wife","aunt","queen","princess").count { t.contains(it) }
+
+        // Normalize language — mul_latin, latin_en etc. treated as English
+        val normalizedLang = when {
+            lang.contains("en") || lang.contains("latin") || lang.contains("mul") -> "en"
+            else -> lang
+        }
+
+        val fScore = when (normalizedLang) {
+            "en" -> listOf(" she "," her "," mrs ","woman","girl","lady","mother",
+                           "sister","daughter","wife","aunt","queen","princess",
+                           "ladies","ma'am","madam","female").count { t.contains(it) }
             "es" -> listOf(" ella ","señora","mamá","mujer","chica","hermana").count { t.contains(it) }
             "fr" -> listOf(" elle ","madame","femme","fille","mère","sœur").count { t.contains(it) }
             "de" -> listOf(" sie ","frau","mutter","schwester","mädchen").count { t.contains(it) }
@@ -161,8 +170,10 @@ object HindiTtsService {
             "ar" -> listOf("هي","امرأة","بنت","أخت","أم").count { t.contains(it) }
             else -> 0
         }
-        val mScore = when (lang) {
-            "en" -> listOf(" he "," him "," his "," mr ","man ","boy ","father","brother","son ","husband","uncle","king","prince").count { t.contains(it) }
+        val mScore = when (normalizedLang) {
+            "en" -> listOf(" he "," him "," his "," mr ","man ","boy ","father",
+                           "brother","son ","husband","uncle","king","prince",
+                           "gentleman","gentlemen","male","sir ").count { t.contains(it) }
             "es" -> listOf(" él ","señor","papá","hombre","chico","hermano").count { t.contains(it) }
             "fr" -> listOf(" il ","monsieur","homme","garçon","père","frère").count { t.contains(it) }
             "de" -> listOf(" er ","herr","vater","bruder","mann","junge").count { t.contains(it) }
@@ -181,7 +192,7 @@ object HindiTtsService {
         val majority = if (fCount > genderHistory.size / 2) Gender.FEMALE else Gender.MALE
         if (majority != detectedGender) {
             detectedGender = majority
-            android.util.Log.d("HindiTTS", "Gender→$majority f=$fScore m=$mScore lang=$lang '${srcText.take(30)}'")
+            android.util.Log.d("HindiTTS", "Gender→$majority f=$fScore m=$mScore lang=$normalizedLang '${srcText.take(40)}'")
         }
     }
 
