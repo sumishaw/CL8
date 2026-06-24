@@ -62,6 +62,7 @@ class OverlayService : Service() {
             instance?.handler?.post {
                 val tv = instance?.textView ?: return@post
                 tv.animate().cancel()
+                tv.maxLines = 10   // never truncate — show full sentence
                 tv.alpha = 1f
                 tv.text  = hindi
             }
@@ -268,17 +269,19 @@ class OverlayService : Service() {
             val sw = resources.displayMetrics.widthPixels
             val tv = TextView(this).apply {
                 typeface  = Typeface.DEFAULT_BOLD
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)   // smaller = more words per line
                 setTextColor(Color.WHITE)
-                setShadowLayer(14f, 1f, 3f, Color.BLACK)
-                maxLines   = 2
-                background = null   // no box — text only
-                setPadding(dp(8), dp(4), dp(8), dp(4))
+                setShadowLayer(12f, 1f, 2f, Color.BLACK)
+                maxLines   = 3                                  // 3 lines ≈ 35-45 Hindi words
+                setLineSpacing(2f, 1.1f)
+                // Semi-transparent dark background — words readable over any video
+                setBackgroundColor(android.graphics.Color.argb(160, 0, 0, 0))
+                setPadding(dp(10), dp(6), dp(10), dp(6))
                 alpha = 0f; text = ""
             }
             textView = tv; overlayView = tv
             params = WindowManager.LayoutParams(
-                (sw * 0.92).toInt(),
+                WindowManager.LayoutParams.MATCH_PARENT,        // full width
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -287,7 +290,7 @@ class OverlayService : Service() {
                     WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT
-            ).apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL; y = dp(90) }
+            ).apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL; y = dp(60) }
 
             var sx = 0f; var sy = 0f; var ix = 0; var iy = 0
             tv.setOnTouchListener { _, ev ->
