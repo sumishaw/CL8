@@ -41,6 +41,10 @@ jobs:
       - name: Install Flutter dependencies
         run: flutter pub get
 
+      - name: Install Android NDK
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;27.0.12077973" ||           echo "y" | $ANDROID_HOME/tools/bin/sdkmanager "ndk;27.0.12077973" ||           echo "NDK install attempted"
+
       - name: Generate Gradle wrapper
         run: |
           cd android
