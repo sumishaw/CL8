@@ -1,145 +1,101 @@
 package com.example.nihongolens
 
 import android.content.Context
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioTrack
+import android.media.MediaRecorder
 import android.util.Log
 import kotlinx.coroutines.*
+import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.Locale
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.*
 
 /**
- * HindiTtsService — Android built-in TTS, zero latency.
+ * HindiTtsService — Piper TTS via hindi_tts_server.py on port 8766
  *
- * NO Kokoro server needed — hindi_tts_server.py is NOT required.
+ * Architecture:
+ *   speak(text) → fetchQueue (unbounded FIFO)
+ *   Fetch worker: text → WAV from Piper (~200-400ms at 1.5x speed)
+ *   Play worker:  WAV → AudioTrack (USAGE_ASSISTANT, excluded from LC capture)
  *
  * Loop prevention:
- *   Mic is muted by MainActivity when overlay starts (see startOverlay handler).
- *   TTS plays through speakers but mic is off → Live Captions cannot hear it.
+ *   AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE: pauses video while TTS plays
+ *   → LC has no video audio to caption → loop impossible
+ *   Token dedup: same sentence never spoken twice
+ *   isSuppressed(): blocks LiveCaptionReader.enqueue() during TTS + grace
  *
- * Token dedup:
- *   Each sentence gets a unique token. Once spoken, token stored in spokenTokens.
- *   Same sentence never spoken twice in a session.
+ * Gender:
+ *   Polls whisper_server :8765/gender (real audio FFT from video)
+ *   Passes gender=male/female to Piper server
+ *   Female: pitch shifted +35% in numpy on server side (no extra model)
  *
- * Gender detection:
- *   Polls whisper_server /gender endpoint (port 8765).
- *   Whisper server already has raw audio PCM from the video and runs FFT.
- *   Male F0 < 165Hz → pitch=1.0, Female F0 ≥ 165Hz → pitch=0.80.
+ * Female/Male voices come from same hi_IN-rohan model — female is
+ * pitch-shifted up. Not a separate model but clearly distinguishable.
  */
 object HindiTtsService {
 
-    private const val TAG = "HindiTTS"
+    private const val TAG      = "HindiTTS"
+    private const val TTS_URL  = "http://127.0.0.1:8766/tts"
+    private const val GENDER_URL = "http://127.0.0.1:8765/gender"
 
     enum class Gender  { AUTO, MALE, FEMALE }
     enum class Emotion { NEUTRAL, HAPPY, SAD, ANGRY, EXCITED, CURIOUS }
 
-    @JvmField @Volatile var enabled        = false
-    @JvmField @Volatile var selectedGender = Gender.AUTO
-    @Volatile var ttsSpeedMultiplier       = 1.5f
-    @Volatile var detectedGender           = Gender.MALE
-    @Volatile var isSpeaking               = false
-    @Volatile private var speakingUntilMs  = 0L
+    @JvmField @Volatile var enabled           = false
+    @JvmField @Volatile var selectedGender    = Gender.AUTO
+    @Volatile var ttsSpeedMultiplier          = 1.5f
+    @Volatile var detectedGender              = Gender.MALE
+    @Volatile var isSpeaking                  = false
+    @Volatile private var speakingUntilMs     = 0L
 
-    private var tts: TextToSpeech? = null
-    private var ttsReady = false
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope       = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var cacheDir: java.io.File? = null
+    private var am: AudioManager? = null
+    private var focusRequest: android.media.AudioFocusRequest? = null
 
-    // Token dedup — never re-speak the same sentence
+    // ── FIFO queues (unbounded — never drop sentences) ────────────────────────
+    data class FetchItem(val text: String, val gender: String, val speed: Float)
+    data class PlayItem (val wav: ByteArray, val durMs: Long)
+
+    private val fetchQueue = LinkedBlockingQueue<FetchItem>()
+    private val playQueue  = LinkedBlockingQueue<PlayItem>()
+
+    // Token dedup — never re-speak same sentence
     private val spokenTokens = java.util.concurrent.ConcurrentHashMap<Int, Boolean>()
-    private var uttId = 0
 
-    // Gender polling
-    private var genderJob: Job? = null
+    private var fetchWorker: Job? = null
+    private var playWorker:  Job? = null
+    private var genderJob:   Job? = null
+
+    // Gender history
     private val genderHistory = ArrayDeque<Gender>()
-    private val GENDER_HIST = 6
+    private val GENDER_HIST   = 5
 
-    // ── Init ──────────────────────────────────────────────────────────────────
+    // ── Init / lifecycle ──────────────────────────────────────────────────────
 
     fun init(context: Context) {
-        // Block Live Captions from capturing TTS audio output
-        // ALLOW_CAPTURE_BY_NONE prevents any system service from capturing this app's audio
-        // This is the only reliable way to prevent the TTS→LiveCaptions→TTS loop
+        cacheDir = context.cacheDir
+        am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        // Prevent LC from capturing this app's audio
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
-            am.allowedCapturePolicy = android.media.AudioAttributes.ALLOW_CAPTURE_BY_NONE
+            am?.allowedCapturePolicy = AudioAttributes.ALLOW_CAPTURE_BY_NONE
         }
-        tts = TextToSpeech(context) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                val res = tts?.setLanguage(Locale("hi", "IN"))
-                if (res == TextToSpeech.LANG_MISSING_DATA ||
-                    res == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    Log.w(TAG, "Hindi TTS voice not installed. Go to: Settings → General management → Language → Text-to-speech → Google TTS → Install voice data → Hindi")
-                    tts?.setLanguage(Locale.ENGLISH)
-                }
-                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(id: String?) { isSpeaking = true }
-                    override fun onDone(id: String?) {
-                        if (tts?.isSpeaking == false) {
-                            isSpeaking = false
-                            speakingUntilMs = System.currentTimeMillis() + 1_500L
-                        }
-                    }
-                    override fun onError(id: String?) {
-                        isSpeaking = false
-                        speakingUntilMs = System.currentTimeMillis() + 1_000L
-                    }
-                })
-                ttsReady = true
-                Log.d(TAG, "TTS ready")
-            }
-        }
+        startFetchWorker()
+        startPlayWorker()
         startGenderPoller()
     }
-
-    // ── Speak ─────────────────────────────────────────────────────────────────
-
-    fun speak(hindi: String) {
-        if (!enabled || !ttsReady || hindi.isBlank()) return
-        val engine = tts ?: return
-
-        // Token dedup — hash of normalised text
-        val norm  = hindi.trim().replace(Regex("\\s+"), " ")
-        val token = norm.hashCode()
-        if (spokenTokens.putIfAbsent(token, true) != null) {
-            Log.d(TAG, "TTS skip (already spoken): '${norm.take(30)}'")
-            return
-        }
-        // Limit token cache size
-        if (spokenTokens.size > 200) spokenTokens.clear()
-
-        val emotion = detectEmotion(hindi)
-        val speed   = (emotionSpeed(emotion) * ttsSpeedMultiplier).coerceIn(0.5f, 4.0f)
-        val gender  = if (selectedGender == Gender.AUTO) detectedGender else selectedGender
-        val pitch   = if (gender == Gender.FEMALE) 1.3f else 1.0f
-
-        engine.setSpeechRate(speed)
-        engine.setPitch(pitch)
-        isSpeaking = true   // set before speak() to block enqueue immediately
-
-        val id = "utt_${uttId++}"
-        val params = Bundle().apply {
-            putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, id)
-            putString(TextToSpeech.Engine.KEY_PARAM_STREAM,
-                android.media.AudioManager.STREAM_MUSIC.toString())
-        }
-        engine.speak(hindi, TextToSpeech.QUEUE_ADD, params, id)
-        Log.d(TAG, "TTS speak pitch=$pitch speed=$speed '${hindi.take(30)}'")
-    }
-
-    fun isSuppressed() = isSpeaking || System.currentTimeMillis() < speakingUntilMs
-
-    // ── Settings ──────────────────────────────────────────────────────────────
 
     fun setEnabled(on: Boolean) {
         enabled = on
         if (!on) {
-            tts?.stop()
-            isSpeaking = false
+            fetchQueue.clear(); playQueue.clear()
+            stopAudio(); releaseAudioFocus()
             spokenTokens.clear()
         }
     }
@@ -148,32 +104,188 @@ object HindiTtsService {
 
     fun setSpeedMultiplier(m: Float) { ttsSpeedMultiplier = m.coerceIn(0.5f, 4.0f) }
 
-    fun destroy() {
-        genderJob?.cancel()
-        tts?.stop(); tts?.shutdown(); tts = null
-        ttsReady = false; scope.cancel()
+    fun isSuppressed() = isSpeaking || System.currentTimeMillis() < speakingUntilMs
+
+    fun stopAndClear() {
+        fetchQueue.clear(); playQueue.clear()
+        stopAudio(); releaseAudioFocus()
+        isSpeaking = false
+        speakingUntilMs = System.currentTimeMillis() + 2_000L
+        spokenTokens.clear()
+        Log.d(TAG, "Stopped (LC silent)")
     }
 
-    // ── Gender polling from whisper_server /gender ────────────────────────────
-    // whisper_server.py already processes raw audio PCM from the video.
-    // It runs FFT and stores gender in _gender_cache.
-    // We poll every 2s — no mic needed, no loop risk.
+    fun destroy() {
+        genderJob?.cancel(); fetchWorker?.cancel(); playWorker?.cancel()
+        fetchQueue.clear(); playQueue.clear()
+        stopAudio(); releaseAudioFocus()
+        scope.cancel()
+    }
+
+    // ── Speak ─────────────────────────────────────────────────────────────────
+
+    fun speak(hindi: String) {
+        if (!enabled || hindi.isBlank()) return
+        val n = hindi.trim().replace(Regex("\\s+"), " ")
+
+        // Token dedup
+        val token = n.hashCode()
+        if (spokenTokens.putIfAbsent(token, true) != null) return
+        if (spokenTokens.size > 300) spokenTokens.clear()
+
+        val emotion = detectEmotion(n)
+        val speed   = (emotionSpeed(emotion) * ttsSpeedMultiplier).coerceIn(0.5f, 4.0f)
+        val gender  = when (selectedGender) {
+            Gender.FEMALE -> "female"
+            Gender.MALE   -> "male"
+            Gender.AUTO   -> if (detectedGender == Gender.FEMALE) "female" else "male"
+        }
+        fetchQueue.offer(FetchItem(n, gender, speed))
+    }
+
+    // ── Fetch worker (Piper HTTP → WAV) ───────────────────────────────────────
+
+    private fun startFetchWorker() {
+        fetchWorker = scope.launch {
+            while (isActive) {
+                val item = fetchQueue.take()   // blocks — never misses
+                if (!enabled) continue
+                try {
+                    val wav = fetchWav(item.text, item.gender, item.speed)
+                    if (wav != null && wav.size > 44) {
+                        val sr  = readInt(wav, 24).coerceAtLeast(8_000)
+                        val nch = readShort(wav, 22).coerceAtLeast(1)
+                        val bit = readShort(wav, 34).coerceAtLeast(8)
+                        val dur = ((wav.size - 44).toLong() * 1000) / (sr.toLong() * nch * (bit / 8))
+                        playQueue.offer(PlayItem(wav, dur))
+                    } else {
+                        Log.w(TAG, "Empty WAV — is hindi_tts_server.py running? Start: python3 ~/hindi_tts_server.py &")
+                    }
+                } catch (e: Exception) { Log.e(TAG, "Fetch: ${e.message}") }
+            }
+        }
+    }
+
+    // ── Play worker (AudioTrack — excluded from LC capture) ───────────────────
+
+    private fun startPlayWorker() {
+        playWorker = scope.launch {
+            while (isActive) {
+                val item = playQueue.take()   // blocks — no gaps
+                if (!enabled) continue
+                try {
+                    isSpeaking = true
+                    requestAudioFocus()       // pauses video → LC has nothing to caption
+                    playWav(item.wav, item.durMs)
+                    releaseAudioFocus()       // video resumes
+                    speakingUntilMs = System.currentTimeMillis() + 800L
+                } catch (e: Exception) {
+                    Log.e(TAG, "Play: ${e.message}")
+                    releaseAudioFocus()
+                } finally {
+                    isSpeaking = false
+                }
+            }
+        }
+    }
+
+    // ── HTTP fetch ────────────────────────────────────────────────────────────
+
+    private suspend fun fetchWav(text: String, gender: String, speed: Float): ByteArray? =
+        withContext(Dispatchers.IO) {
+            var conn: HttpURLConnection? = null
+            try {
+                val enc = java.net.URLEncoder.encode(text, "UTF-8")
+                conn = URL("$TTS_URL?text=$enc&gender=$gender&speed=$speed")
+                    .openConnection() as HttpURLConnection
+                conn.connectTimeout = 5_000
+                conn.readTimeout    = 20_000
+                if (conn.responseCode == 200) conn.inputStream.readBytes() else null
+            } catch (e: Exception) { null }
+            finally { try { conn?.disconnect() } catch (_: Exception) {} }
+        }
+
+    // ── AudioTrack playback (USAGE_ASSISTANT = excluded from LC) ─────────────
+
+    private var audioTrack: AudioTrack? = null
+
+    private fun stopAudio() {
+        try { audioTrack?.stop() } catch (_: Exception) {}
+        try { audioTrack?.release() } catch (_: Exception) {}
+        audioTrack = null
+    }
+
+    private suspend fun playWav(wav: ByteArray, durMs: Long) = withContext(Dispatchers.IO) {
+        try {
+            val sr   = readInt(wav, 24).coerceAtLeast(8_000)
+            val nch  = readShort(wav, 22)
+            val bit  = readShort(wav, 34)
+            val pcm  = wav.copyOfRange(44, wav.size)
+            val fmt  = if (bit == 16) AudioFormat.ENCODING_PCM_16BIT else AudioFormat.ENCODING_PCM_8BIT
+            val chan = if (nch == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
+            val minBuf = AudioTrack.getMinBufferSize(sr, chan, fmt).coerceAtLeast(pcm.size)
+
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(AudioAttributes.Builder()
+                    // USAGE_ASSISTANT: system services (including Live Captions)
+                    // cannot capture audio with this usage type
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build())
+                .setAudioFormat(AudioFormat.Builder()
+                    .setSampleRate(sr).setChannelMask(chan).setEncoding(fmt).build())
+                .setBufferSizeInBytes(minBuf)
+                .setTransferMode(AudioTrack.MODE_STATIC)
+                .build()
+
+            stopAudio()
+            audioTrack = track
+            track.write(pcm, 0, pcm.size)
+            track.setVolume(AudioTrack.getMaxVolume())
+            track.play()
+
+            // Wait for playback to finish
+            delay(durMs + 200L)
+            track.stop(); track.release()
+            audioTrack = null
+        } catch (e: Exception) { Log.e(TAG, "playWav: ${e.message}") }
+    }
+
+    // ── Audio focus (pauses video while TTS plays) ────────────────────────────
+
+    private fun requestAudioFocus() {
+        val manager = am ?: return
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val req = android.media.AudioFocusRequest.Builder(
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                .setAudioAttributes(AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                .setOnAudioFocusChangeListener {}.build()
+            focusRequest = req
+            manager.requestAudioFocus(req)
+        }
+    }
+
+    private fun releaseAudioFocus() {
+        val req = focusRequest ?: return
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            am?.abandonAudioFocusRequest(req)
+        }
+        focusRequest = null
+    }
+
+    // ── Gender poller ─────────────────────────────────────────────────────────
 
     private fun startGenderPoller() {
-        genderJob?.cancel()
         genderJob = scope.launch {
-            Log.d(TAG, "Gender poller started → :8765/gender")
             while (isActive) {
                 if (selectedGender == Gender.AUTO && !isSuppressed()) {
                     try {
-                        val conn = URL("http://127.0.0.1:8765/gender")
-                            .openConnection() as HttpURLConnection
-                        conn.connectTimeout = 1_500
-                        conn.readTimeout    = 2_000
-                        conn.requestMethod  = "GET"
+                        val conn = URL(GENDER_URL).openConnection() as HttpURLConnection
+                        conn.connectTimeout = 1_500; conn.readTimeout = 2_000
                         if (conn.responseCode == 200) {
-                            val json = org.json.JSONObject(
-                                conn.inputStream.bufferedReader().readText())
+                            val json = JSONObject(conn.inputStream.bufferedReader().readText())
                             val g    = json.optString("gender", "")
                             val conf = json.optInt("confidence", 0)
                             if ((g == "female" || g == "male") && conf >= 2) {
@@ -197,22 +309,28 @@ object HindiTtsService {
         }
     }
 
-    // ── Emotion helpers ───────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private fun detectEmotion(text: String): Emotion {
-        val t = text.trim()
+    private fun detectEmotion(t: String): Emotion {
         if (t.endsWith("!") || t.endsWith("！")) return Emotion.EXCITED
         if (t.endsWith("?") || t.endsWith("？")) return Emotion.CURIOUS
         val l = t.lowercase()
-        if (listOf("दुखी","उदास","sad","cry","sorry").any { l.contains(it) }) return Emotion.SAD
-        if (listOf("गुस्सा","angry","hate").any           { l.contains(it) }) return Emotion.ANGRY
-        if (listOf("वाह","wow","खुश","love","great").any  { l.contains(it) }) return Emotion.HAPPY
+        if (listOf("दुखी","उदास","sad","sorry","cry").any { l.contains(it) }) return Emotion.SAD
+        if (listOf("गुस्सा","angry","hate","damn").any  { l.contains(it) }) return Emotion.ANGRY
+        if (listOf("वाह","wow","खुश","love","great").any { l.contains(it) }) return Emotion.HAPPY
         return Emotion.NEUTRAL
     }
 
     private fun emotionSpeed(e: Emotion) = when (e) {
-        Emotion.EXCITED -> 1.10f; Emotion.HAPPY   -> 1.05f
-        Emotion.CURIOUS -> 0.97f; Emotion.SAD      -> 0.88f
-        Emotion.ANGRY   -> 1.08f; Emotion.NEUTRAL  -> 1.00f
+        Emotion.EXCITED -> 1.10f; Emotion.HAPPY -> 1.05f
+        Emotion.CURIOUS -> 0.97f; Emotion.SAD   -> 0.88f
+        Emotion.ANGRY   -> 1.08f; else          -> 1.00f
     }
+
+    private fun readInt(b: ByteArray, o: Int) =
+        ((b[o+3].toInt() and 0xFF) shl 24) or ((b[o+2].toInt() and 0xFF) shl 16) or
+        ((b[o+1].toInt() and 0xFF) shl  8) or  (b[o].toInt() and 0xFF)
+
+    private fun readShort(b: ByteArray, o: Int) =
+        ((b[o+1].toInt() and 0xFF) shl 8) or (b[o].toInt() and 0xFF)
 }
