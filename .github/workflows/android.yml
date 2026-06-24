@@ -43,7 +43,17 @@ jobs:
 
       - name: Install Android NDK
         run: |
-          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;27.0.12077973" ||           echo "y" | $ANDROID_HOME/tools/bin/sdkmanager "ndk;27.0.12077973" ||           echo "NDK install attempted"
+          NDK_DIR="$ANDROID_HOME/ndk/27.0.12077973"
+          if [ -d "$NDK_DIR" ] && [ ! -f "$NDK_DIR/source.properties" ]; then
+            echo "Removing incomplete NDK"
+            rm -rf "$NDK_DIR"
+          fi
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;27.0.12077973"
+          if [ -f "$NDK_DIR/source.properties" ]; then
+            echo "NDK OK"; cat "$NDK_DIR/source.properties"
+          else
+            echo "NDK source.properties missing — build may fail"
+          fi
 
       - name: Generate Gradle wrapper
         run: |
