@@ -44,9 +44,9 @@ jobs:
       - name: Generate Gradle wrapper
         run: |
           cd android
-          curl -sL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/gradle.zip
+          curl -sL https://services.gradle.org/distributions/gradle-8.9-bin.zip -o /tmp/gradle.zip
           unzip -q /tmp/gradle.zip -d /tmp/gradle-install
-          /tmp/gradle-install/gradle-8.7/bin/gradle wrapper --gradle-version 8.7 --distribution-type all
+          /tmp/gradle-install/gradle-8.9/bin/gradle wrapper --gradle-version 8.9 --distribution-type all
           chmod +x gradlew
           echo "gradlew generated successfully"
 
