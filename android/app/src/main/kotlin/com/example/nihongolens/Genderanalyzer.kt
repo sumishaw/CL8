@@ -79,7 +79,7 @@ object GenderAnalyzer {
         accumFill = 0
         frameCount = 0; analyzeCount = 0
         captureJob = scope.launch { captureLoop(projection) }
-        CaptionLogger.log(TAG, "started — dedicated USAGE_MEDIA capture")
+        CaptionLogger.log(TAG, ">>> STARTED dedicated USAGE_MEDIA capture SR=$SR WIN=$WIN thresh=$YIN_THRESHOLD <<<")
     }
 
     fun stop() {
@@ -138,8 +138,11 @@ object GenderAnalyzer {
         try {
             while (currentCoroutineContext().isActive && enabled) {
                 val read = rec.read(buf, 0, buf.size)
-                if (read > 0) ingestPcm(buf, read)
-                else if (read < 0) {
+                if (read > 0) {
+                    readCount++
+                    if (readCount == 1) CaptionLogger.log(TAG, "FIRST read! $read bytes — audio flowing")
+                    ingestPcm(buf, read)
+                } else if (read < 0) {
                     CaptionLogger.log(TAG, "rec.read error=$read — stopping")
                     break
                 }
@@ -180,16 +183,22 @@ object GenderAnalyzer {
 
     // ── YIN pitch detection ───────────────────────────────────────────────────
 
+    private var readCount = 0  // counts captureLoop rec.read() calls
+
     private fun analyze() {
         analyzeCount++
+
+        // Log every 5 frames to confirm data is flowing
+        if (analyzeCount % 5 == 0)
+            CaptionLogger.log(TAG, "frame #$analyzeCount reads=$readCount enabled=$enabled")
 
         // RMS energy check — skip silence
         var energy = 0.0
         for (s in accum) energy += s.toLong() * s
         val rms = sqrt(energy / WIN).toFloat()
         if (rms < RMS_FLOOR) {
-            if (analyzeCount % 30 == 0)
-                CaptionLogger.log(TAG, "analyze #$analyzeCount rms=${rms.toInt()} SILENT")
+            if (analyzeCount % 5 == 0)
+                CaptionLogger.log(TAG, "SILENT rms=${rms.toInt()} floor=$RMS_FLOOR")
             return
         }
 
@@ -244,10 +253,9 @@ object GenderAnalyzer {
     private fun onPitchDetected(f0: Float, rms: Float) {
         frameCount++
 
-        // Log every 3rd voiced frame for visibility in Log tab
-        if (frameCount % 3 == 0)
-            CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz rms=${rms.toInt()} " +
-                "→ ${if (f0 >= 165f) "FEMALE" else "MALE"}")
+        // Log every voiced frame (HIST=1 means every frame matters)
+        CaptionLogger.log(TAG, "PITCH F0=${f0.toInt()}Hz rms=${rms.toInt()} " +
+            "→ ${if (f0 >= 165f) "FEMALE" else "MALE"} cur=${HindiTtsService.detectedGender}")
 
         val detected = if (f0 >= 165f) HindiTtsService.Gender.FEMALE
                        else             HindiTtsService.Gender.MALE
