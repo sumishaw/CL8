@@ -298,7 +298,7 @@ class LiveCaptionReader : AccessibilityService() {
         val wordCount = words.size
 
         // Always cap at 12 words for translation — keeps TTS under 3s per chunk
-        val toTranslate = if (wordCount > 12) words.take(12).joinToString(" ") else trimmed
+        val toTranslate = if (wordCount > 20) words.take(20).joinToString(" ") else trimmed
 
         // TRIGGER 1a: strong punctuation → translate immediately (100ms settle)
         val endsWithHardPunct = trimmed.endsWith(".") || trimmed.endsWith("?") ||
@@ -309,7 +309,7 @@ class LiveCaptionReader : AccessibilityService() {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
                 delay(100)
-                val t = capWords(sentenceBuffer.trim(), 12)
+                val t = capWords(sentenceBuffer.trim(), 20)
                 if (t.isNotBlank() && t != lastEnqueuedText) {
                     lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
                     enqueue(t); sentenceBuffer = ""
@@ -326,7 +326,7 @@ class LiveCaptionReader : AccessibilityService() {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
                 delay(350)
-                val t = capWords(sentenceBuffer.trim(), 12)
+                val t = capWords(sentenceBuffer.trim(), 20)
                 if (t.isNotBlank() && t != lastEnqueuedText) {
                     lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
                     enqueue(t); sentenceBuffer = ""
@@ -342,7 +342,7 @@ class LiveCaptionReader : AccessibilityService() {
             sentenceTimerJob?.cancel(); pendingJob?.cancel()
             pendingJob = scope.launch {
                 delay(150)  // brief settle for word correction
-                val t = capWords(sentenceBuffer.trim(), 12)
+                val t = capWords(sentenceBuffer.trim(), 20)
                 if (t.isNotBlank() && t != lastEnqueuedText) {
                     lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
                     enqueue(t); sentenceBuffer = ""
@@ -355,7 +355,7 @@ class LiveCaptionReader : AccessibilityService() {
         sentenceTimerJob?.cancel()
         sentenceTimerJob = scope.launch {
             delay(SENTENCE_SILENCE_MS)
-            val t = capWords(sentenceBuffer.trim(), 12)
+            val t = capWords(sentenceBuffer.trim(), 20)
             if (t.isNotBlank() && t != lastEnqueuedText && wordCount >= 2) {
                 CaptionLogger.log(TAG, "SILENCE translate")
                 lastEnqueuedText = t; lastEnqueuedWordCount = wordCount
@@ -366,10 +366,10 @@ class LiveCaptionReader : AccessibilityService() {
     }
 
         private fun capWords(text: String, maxWords: Int): String {
-        val words = text.trim().split(Regex("\\s+"))
-        return if (words.size <= maxWords) text.trim()
-               else words.take(maxWords).joinToString(" ")
-    }
+            // Return full sentence — no truncation
+            // All words must be spoken; cutting breaks meaning
+            return text.trim()
+        }
 
     private fun enqueue(text: String) {
         if (text.isBlank() || text.length < 4) return
