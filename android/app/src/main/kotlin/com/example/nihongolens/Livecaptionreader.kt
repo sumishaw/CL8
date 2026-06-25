@@ -117,7 +117,7 @@ class LiveCaptionReader : AccessibilityService() {
         isRunning = false; instance = null
         GenderAnalyzer.stop()   // stop mic AudioRecord cleanly
         pendingJob?.cancel()
-        watchdogJob?.cancel(); translateJob?.cancel()
+        watchdogJob?.cancel(); translateJob?.cancel(); translateJob2?.cancel()
         queue.clear(); scope.cancel()
         SpeechCaptureService.latestHindi    = ""
         SpeechCaptureService.latestEnglish  = ""
@@ -418,6 +418,14 @@ class LiveCaptionReader : AccessibilityService() {
             return
         }
 
+        // If this text is just a longer version of what's already queued (LC growth),
+        // remove the shorter version from queue — it will be superseded
+        if (n.startsWith(lastEnqueued) && lastEnqueued.length > 10) {
+            // Remove the shorter prefix from queue if still there
+            queue.removeIf { norm(it.text) == lastEnqueued }
+            CaptionLogger.log(TAG, "SUPERSEDE: removed shorter prefix")
+        }
+
         lastEnqueued = n
         val seq = seqCounter.incrementAndGet()
 
@@ -440,13 +448,21 @@ class LiveCaptionReader : AccessibilityService() {
 
     // ── Translation worker ────────────────────────────────────────────────────
 
+    private var translateJob2: Job? = null
+
     private fun startWorker() {
-        translateJob = scope.launch {
-            while (isActive) {
-                val item = withContext(Dispatchers.IO) {
-                    try { queue.poll(2, TimeUnit.SECONDS) }
-                    catch (_: InterruptedException) { null }
-                } ?: continue
+        // Start 2 parallel workers — doubles translation throughput
+        // Both pull from same queue; order preserved by seq numbers in OverlayService
+        translateJob  = scope.launch { workerLoop("W1") }
+        translateJob2 = scope.launch { workerLoop("W2") }
+    }
+
+    private suspend fun workerLoop(name: String) {
+        while (currentCoroutineContext().isActive) {
+            val item = withContext(Dispatchers.IO) {
+                try { queue.poll(2, TimeUnit.SECONDS) }
+                catch (_: InterruptedException) { null }
+            } ?: continue
 
                 val seq  = item.seq
                 val text = item.text
@@ -492,7 +508,7 @@ class LiveCaptionReader : AccessibilityService() {
                 lastHindiTime = now
 
                 okCount.incrementAndGet()
-                CaptionLogger.log(TAG, "OK $seq ${ms}ms lang=$serverLang '${hindi.take(50)}'")
+                CaptionLogger.log(TAG, "OK[$name] $seq ${ms}ms lang=$serverLang '${hindi.take(50)}'")
                 SpeechCaptureService.latestHindi   = hindi
                 SpeechCaptureService.latestEnglish = text
 
