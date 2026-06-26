@@ -162,6 +162,7 @@ class SpeechCaptureService : Service() {
             updateNotification("Voice gender detection active")
             CaptionLogger.log("SCS", "gender-only mode — starting GenderAnalyzer with projection")
             GenderAnalyzer.start(sharedProjection, this.applicationContext)
+            BackgroundMusicRecorder.start(sharedProjection)  // dedicated BG audio channel
             return START_STICKY   // stay alive to keep projection valid
         }
 
@@ -180,6 +181,7 @@ class SpeechCaptureService : Service() {
         workerThread?.interrupt();  workerThread  = null
         audioQueue.clear()
         GenderAnalyzer.stop()
+        BackgroundMusicRecorder.stop()
         try { audioRecord?.stop()    } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
