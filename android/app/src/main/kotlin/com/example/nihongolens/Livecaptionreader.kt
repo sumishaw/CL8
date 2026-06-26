@@ -417,16 +417,14 @@ class LiveCaptionReader : AccessibilityService() {
             CaptionLogger.log(TAG, "SKIP dup")
             return
         }
-
-        // Skip pure music/sound annotations — no translatable content
+        // Skip sound annotations — no translatable speech
         val tr = text.trim()
         val isAnnotation = (tr.startsWith("(") && tr.endsWith(")")) ||
                            (tr.startsWith("[") && tr.endsWith("]"))
         val stripped = tr.removeSurrounding("(", ")").removeSurrounding("[", "]").trim().lowercase()
         if (isAnnotation && stripped in setOf("music", "singing", "applause",
                 "laughter", "cheering", "instrumental", "song", "sound effects")) {
-            CaptionLogger.log(TAG, "SKIP annotation: $tr")
-            return
+            CaptionLogger.log(TAG, "SKIP annotation: $tr"); return
         }
 
         // If this text is just a longer version of what's already queued (LC growth),
@@ -530,7 +528,6 @@ class LiveCaptionReader : AccessibilityService() {
                 // Gender detection is audio-only (GenderAnalyzer.kt) — no pronoun detection
                 // Pass English source text for feminine verb form hints (she/her → ती/ी)
                 // This ONLY affects verb conjugation, NOT voice switching
-                // Only speak if sentence is still fresh (< 5s since enqueue)
                 val speakAge = System.currentTimeMillis() - item.enqMs
                 if (speakAge < 5_000L) {
                     HindiTtsService.speak(hindi, text)
