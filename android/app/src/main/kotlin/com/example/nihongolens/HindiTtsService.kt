@@ -183,15 +183,20 @@ object HindiTtsService {
         if (!enabled || hindi.isBlank() || !ttsReady) return
         val n = hindi.trim().replace(Regex("\\s+"), " ")
 
-        val token = n.hashCode()
-        if (spokenTokens.putIfAbsent(token, true) != null) return
-        if (spokenTokens.size > 300) spokenTokens.clear()
-
         val isFemale = when (selectedGender) {
             Gender.FEMALE -> true
             Gender.MALE   -> false
             Gender.AUTO   -> (detectedGender == Gender.FEMALE)
         }
+
+        // FIX BUG 1: Include gender in dedup token.
+        // Previously token = n.hashCode() — when gender switched on same sentence,
+        // putIfAbsent found existing token → skipped → gender never applied.
+        // Now token includes gender so re-play occurs on switch.
+        val genderBit = if (isFemale) 0x80000000.toInt() else 0
+        val token = n.hashCode() xor genderBit
+        if (spokenTokens.putIfAbsent(token, true) != null) return
+        if (spokenTokens.size > 300) spokenTokens.clear()
         val genderTag = if (isFemale) "female" else "male"
 
         // Emotion → pitch/rate adjustments
@@ -239,12 +244,105 @@ object HindiTtsService {
                 val sr = 22050L  // Android TTS default sample rate
                 val durMs = if (fileSize > 44) ((fileSize - 44) * 1000L) / (sr * 2L) else 2000L
 
-                CaptionLogger.log(TAG, "TTS-WAV ${ms}ms ${durMs}ms '${item.text.take(40)}'")
-                playQueue.offer(PlayItem(item.text, wavFile, durMs))
+                // FIX BUG 2: Mix background music into TTS WAV at Android side.
+                // BackgroundMusicRecorder captured the bg chunk at sentence enqueue time (bgSeq).
+                // mixBgMusic() retrieves that chunk and mixes it under speech at 28% volume.
+                // This is done here (not server) because Android TTS bypasses /tts endpoint.
+                val mixedFile = mixBgMusic(wavFile, item.bgSeq) ?: wavFile
+
+                CaptionLogger.log(TAG, "TTS-WAV ${ms}ms ${durMs}ms bg=${item.bgSeq} '${item.text.take(40)}'")
+                playQueue.offer(PlayItem(item.text, mixedFile, durMs))
             }
         }
     }
 
+    // ── Background music mixing ────────────────────────────────────────────────
+    // BG_MIX_VOLUME: bg music at 28% — audible ambience without drowning speech
+    private val BG_MIX_VOLUME = 0.28f
+
+    private fun mixBgMusic(ttsWav: File, bgSeq: Int): File? {
+        if (bgSeq <= 0) return null
+        val bgPcm = BackgroundMusicRecorder.getChunk(bgSeq) ?: return null
+        try {
+            val ttsBytes = ttsWav.readBytes()
+            if (ttsBytes.size <= 44) return null
+
+            val sr     = readInt(ttsBytes, 24)
+            val nch    = readShort(ttsBytes, 22)
+            val bit    = readShort(ttsBytes, 34)
+            val ttsPcm = ttsBytes.copyOfRange(44, ttsBytes.size)
+
+            // TTS: mono 22050Hz int16
+            val ttsShorts = ShortArray(ttsPcm.size / 2) { i ->
+                ((ttsPcm[i*2+1].toInt() shl 8) or (ttsPcm[i*2].toInt() and 0xFF)).toShort()
+            }
+
+            // BG: stereo 44100Hz int16 → mono 22050Hz (downsample 2:1 by averaging)
+            val bgShorts = ShortArray(bgPcm.size / 2) { i ->
+                ((bgPcm[i*2+1].toInt() shl 8) or (bgPcm[i*2].toInt() and 0xFF)).toShort()
+            }
+            // Stereo channels → mono (every 2 shorts = L+R → average)
+            val bgMono44k = ShortArray(bgShorts.size / 2) { i ->
+                ((bgShorts[i*2].toInt() + bgShorts[i*2+1].toInt()) / 2).toShort()
+            }
+            // Downsample 44100 → 22050 (every 2 samples → 1 by averaging)
+            val bgMono22k = ShortArray(bgMono44k.size / 2) { i ->
+                ((bgMono44k[i*2].toInt() + bgMono44k[i*2+1].toInt()) / 2).toShort()
+            }
+
+            // Normalize BG energy to ~20% of TTS energy
+            val ttsRms = ttsShorts.map { it.toLong() * it }.average().let { Math.sqrt(it) }
+            val bgRms  = bgMono22k.map { it.toLong() * it }.average().let { Math.sqrt(it) }
+            val normFactor = if (bgRms > 10) (ttsRms / bgRms * BG_MIX_VOLUME).toFloat() else 0f
+
+            // Mix and clip
+            val n = minOf(ttsShorts.size, bgMono22k.size)
+            val mixed = ByteArray(ttsShorts.size * 2)
+            for (i in ttsShorts.indices) {
+                val ttsS = ttsShorts[i].toInt()
+                val bgS  = if (i < bgMono22k.size) (bgMono22k[i] * normFactor).toInt() else 0
+                val out  = (ttsS + bgS).coerceIn(-32767, 32767).toShort()
+                mixed[i*2]   = (out.toInt() and 0xFF).toByte()
+                mixed[i*2+1] = (out.toInt() shr 8).toByte()
+            }
+
+            // Write mixed WAV
+            val outFile = File(cacheDir, "tts_mixed_${bgSeq}.wav")
+            writeWav(outFile, mixed, sr, nch, bit)
+            ttsWav.delete()
+
+            CaptionLogger.log(TAG, "BG-MIX seq=$bgSeq norm=${String.format("%.2f", normFactor)} merged")
+            return outFile
+        } catch (e: Exception) {
+            CaptionLogger.log(TAG, "BG-MIX failed: ${e.message}")
+            return null
+        }
+    }
+
+    private fun writeWav(file: File, pcm: ByteArray, sr: Int, nch: Int, bit: Int) {
+        file.outputStream().use { out ->
+            val dataLen = pcm.size
+            val header = ByteArray(44)
+            fun putInt(buf: ByteArray, off: Int, v: Int) {
+                buf[off]   = (v and 0xFF).toByte(); buf[off+1] = (v shr 8 and 0xFF).toByte()
+                buf[off+2] = (v shr 16 and 0xFF).toByte(); buf[off+3] = (v shr 24 and 0xFF).toByte()
+            }
+            fun putShort(buf: ByteArray, off: Int, v: Int) {
+                buf[off] = (v and 0xFF).toByte(); buf[off+1] = (v shr 8 and 0xFF).toByte()
+            }
+            header[0]=82;header[1]=73;header[2]=70;header[3]=70  // RIFF
+            putInt(header, 4, 36 + dataLen)
+            header[8]=87;header[9]=65;header[10]=86;header[11]=69  // WAVE
+            header[12]=102;header[13]=109;header[14]=116;header[15]=32  // fmt
+            putInt(header, 16, 16); putShort(header, 20, 1)
+            putShort(header, 22, nch); putInt(header, 24, sr)
+            putInt(header, 28, sr * nch * bit / 8)
+            putShort(header, 32, nch * bit / 8); putShort(header, 34, bit)
+            header[36]=100;header[37]=97;header[38]=116;header[39]=97  // data
+            putInt(header, 40, dataLen)
+            out.write(header); out.write(pcm)
+        }
+    }
     // ── Android TTS synthesize to file (async with coroutine bridge) ──────────
 
     private suspend fun synthesizeToFile(item: FetchItem): File? =
@@ -374,35 +472,40 @@ object HindiTtsService {
     }
 
     // ── Emotion → pitch + rate multipliers ───────────────────────────────────
-    // These modify Android TTS pitch and speech rate to match emotional character
-
+    // FIX BUG 3: Previous values were too subtle (e.g. HAPPY: pitch 1.05 → barely noticeable)
+    // Now each emotion has strong, clearly distinguishable vocal character:
+    //   pitch: applied ON TOP of base (female=1.15, male=0.88)
+    //   rate: multiplied with ttsSpeedMultiplier (default 1.6)
+    // Range: pitch 0.70–1.40 (wide), rate 0.70–1.40 (wide)
     private fun emotionPitchRate(e: Emotion): Pair<Float, Float> = when (e) {
-        Emotion.NEUTRAL    -> Pair(1.00f, 1.00f)
-        Emotion.HAPPY      -> Pair(1.05f, 1.08f)
-        Emotion.SAD        -> Pair(0.90f, 0.85f)
-        Emotion.ANGRY      -> Pair(0.95f, 1.10f)
-        Emotion.EXCITED    -> Pair(1.10f, 1.12f)
-        Emotion.CURIOUS    -> Pair(1.03f, 0.97f)
-        Emotion.WARM       -> Pair(0.97f, 0.93f)
-        Emotion.FEARFUL    -> Pair(1.05f, 1.08f)
-        Emotion.SURPRISED  -> Pair(1.08f, 1.05f)
-        Emotion.SIGHING    -> Pair(0.88f, 0.82f)
-        Emotion.SINGING    -> Pair(1.05f, 0.88f)
-        Emotion.GASPING    -> Pair(1.10f, 1.18f)
-        Emotion.PANTING    -> Pair(1.08f, 1.20f)
-        Emotion.MOANING    -> Pair(0.85f, 0.78f)
-        Emotion.STRAINED   -> Pair(0.95f, 0.90f)
-        Emotion.GRAVELLY   -> Pair(0.88f, 0.95f)
-        Emotion.RASPY      -> Pair(0.90f, 0.95f)
-        Emotion.HUSKY      -> Pair(0.92f, 0.90f)
-        Emotion.WHISPERY   -> Pair(0.92f, 0.88f)
-        Emotion.MURMURED   -> Pair(0.90f, 0.85f)
-        Emotion.HUSHED     -> Pair(0.88f, 0.85f)
-        Emotion.BREATHY    -> Pair(0.93f, 0.90f)
-        Emotion.SULTRY     -> Pair(0.88f, 0.83f)
-        Emotion.TENDER     -> Pair(0.93f, 0.88f)
-        Emotion.VELVETY    -> Pair(0.90f, 0.87f)
-        Emotion.DISGUST    -> Pair(0.95f, 1.05f)
+        // ── Core emotions (very distinct) ────────────────────────────────────
+        Emotion.NEUTRAL    -> Pair(1.00f, 1.00f)   // baseline
+        Emotion.HAPPY      -> Pair(1.25f, 1.20f)   // high pitched, fast, upbeat
+        Emotion.SAD        -> Pair(0.75f, 0.70f)   // low, slow, heavy
+        Emotion.ANGRY      -> Pair(0.85f, 1.30f)   // forceful, clipped, fast
+        Emotion.EXCITED    -> Pair(1.35f, 1.35f)   // very high, very fast
+        Emotion.CURIOUS    -> Pair(1.15f, 0.90f)   // slightly rising, thoughtful
+        // ── Textured emotions ────────────────────────────────────────────────
+        Emotion.WARM       -> Pair(0.95f, 0.85f)   // gentle, warm, slower
+        Emotion.FEARFUL    -> Pair(1.30f, 1.25f)   // high, fast, tense
+        Emotion.SURPRISED  -> Pair(1.40f, 1.15f)   // very high pitch spike
+        Emotion.SIGHING    -> Pair(0.80f, 0.72f)   // low, very slow, breathy
+        Emotion.SINGING    -> Pair(1.10f, 0.75f)   // melodic, slow
+        Emotion.GASPING    -> Pair(1.35f, 1.40f)   // high, very fast
+        Emotion.PANTING    -> Pair(1.20f, 1.38f)   // high, rapid
+        Emotion.MOANING    -> Pair(0.72f, 0.65f)   // very low, very slow
+        Emotion.STRAINED   -> Pair(0.90f, 0.85f)   // strained effort
+        Emotion.GRAVELLY   -> Pair(0.70f, 0.90f)   // very low, rough
+        Emotion.RASPY      -> Pair(0.75f, 0.92f)   // low, slightly raspy
+        Emotion.HUSKY      -> Pair(0.80f, 0.88f)   // husky, low
+        Emotion.WHISPERY   -> Pair(0.90f, 0.78f)   // quiet, slow
+        Emotion.MURMURED   -> Pair(0.85f, 0.75f)   // very quiet, slow
+        Emotion.HUSHED     -> Pair(0.88f, 0.73f)   // hushed whisper
+        Emotion.BREATHY    -> Pair(0.92f, 0.82f)   // breathy, slow
+        Emotion.SULTRY     -> Pair(0.78f, 0.70f)   // very low, very slow
+        Emotion.TENDER     -> Pair(0.95f, 0.80f)   // gentle, soft
+        Emotion.VELVETY    -> Pair(0.85f, 0.78f)   // smooth, low, slow
+        Emotion.DISGUST    -> Pair(0.88f, 1.10f)   // low, sharp, clipped
     }
 
     // ── WAV helpers ───────────────────────────────────────────────────────────
@@ -426,13 +529,162 @@ object HindiTtsService {
 
     fun toFeminineHindi(text: String): String {
         var t = text
-        t = t.replace("ता हूँ", "ती हूँ").replace("ता हूं", "ती हूं")
-        t = t.replace("रहा हूँ", "रही हूँ").replace("रहा हूं", "रही हूं")
-        t = t.replace("ता है", "ती है").replace("रहा है", "रही है")
-        t = t.replace("ता था", "ती थी").replace("रहा था", "रही थी")
-        t = t.replace("गया", "गई").replace("गए", "गईं")
-        t = t.replace("आया", "आई").replace("आए", "आईं")
-        t = t.replace("किया", "की").replace("लिया", "ली")
+
+        // ── Pronouns ─────────────────────────────────────────────────────────
+        t = t.replace("वह", "वह")          // stays same but triggers fem verbs below
+        t = t.replace("मैं", "मैं")         // stays same
+
+        // ── First person present ──────────────────────────────────────────────
+        t = t.replace("ता हूँ", "ती हूँ")
+        t = t.replace("ता हूं", "ती हूं")
+        t = t.replace("रहा हूँ", "रही हूँ")
+        t = t.replace("रहा हूं", "रही हूं")
+        t = t.replace("सकता हूँ", "सकती हूँ")
+        t = t.replace("सकता हूं", "सकती हूं")
+        t = t.replace("चाहता हूँ", "चाहती हूँ")
+        t = t.replace("चाहता हूं", "चाहती हूं")
+        t = t.replace("जाता हूँ", "जाती हूँ")
+        t = t.replace("जाता हूं", "जाती हूं")
+        t = t.replace("खाता हूँ", "खाती हूँ")
+        t = t.replace("खाता हूं", "खाती हूं")
+        t = t.replace("आता हूँ", "आती हूँ")
+        t = t.replace("आता हूं", "आती हूं")
+        t = t.replace("देता हूँ", "देती हूँ")
+        t = t.replace("देता हूं", "देती हूं")
+        t = t.replace("लेता हूँ", "लेती हूँ")
+        t = t.replace("लेता हूं", "लेती हूं")
+        t = t.replace("करता हूँ", "करती हूँ")
+        t = t.replace("करता हूं", "करती हूं")
+        t = t.replace("सोचता हूँ", "सोचती हूँ")
+        t = t.replace("सोचता हूं", "सोचती हूं")
+        t = t.replace("लगता हूँ", "लगती हूँ")
+        t = t.replace("लगता हूं", "लगती हूं")
+
+        // ── Third person present singular ─────────────────────────────────────
+        t = t.replace("ता है", "ती है")
+        t = t.replace("ते हैं", "ती हैं")
+        t = t.replace("रहा है", "रही है")
+        t = t.replace("रहे हैं", "रही हैं")
+        t = t.replace("सकता है", "सकती है")
+        t = t.replace("सकते हैं", "सकती हैं")
+        t = t.replace("चाहता है", "चाहती है")
+        t = t.replace("चाहते हैं", "चाहती हैं")
+        t = t.replace("होता है", "होती है")
+        t = t.replace("होते हैं", "होती हैं")
+        t = t.replace("लगता है", "लगती है")
+        t = t.replace("लगते हैं", "लगती हैं")
+        t = t.replace("जाता है", "जाती है")
+        t = t.replace("जाते हैं", "जाती हैं")
+        t = t.replace("आता है", "आती है")
+        t = t.replace("आते हैं", "आती हैं")
+        t = t.replace("करता है", "करती है")
+        t = t.replace("करते हैं", "करती हैं")
+        t = t.replace("मिलता है", "मिलती है")
+        t = t.replace("देता है", "देती है")
+        t = t.replace("लेता है", "लेती है")
+        t = t.replace("सोचता है", "सोचती है")
+        t = t.replace("बोलता है", "बोलती है")
+        t = t.replace("समझता है", "समझती है")
+        t = t.replace("रखता है", "रखती है")
+
+        // ── Past tense (था → थी) ──────────────────────────────────────────────
+        t = t.replace("था", "थी")           // USER REQUESTED: था → थी
+        t = t.replace("थे", "थीं")
+        t = t.replace("ता था", "ती थी")
+        t = t.replace("रहा था", "रही थी")
+        t = t.replace("सकता था", "सकती थी")
+        t = t.replace("चाहता था", "चाहती थी")
+        t = t.replace("होता था", "होती थी")
+        t = t.replace("जाता था", "जाती थी")
+        t = t.replace("आता था", "आती थी")
+        t = t.replace("करता था", "करती थी")
+        t = t.replace("लगता था", "लगती थी")
+
+        // ── Past participle ────────────────────────────────────────────────────
+        t = t.replace("गया", "गई")
+        t = t.replace("गए", "गईं")
+        t = t.replace("आया", "आई")
+        t = t.replace("आए", "आईं")
+        t = t.replace("किया", "की")
+        t = t.replace("लिया", "ली")
+        t = t.replace("दिया", "दी")
+        t = t.replace("पाया", "पाई")
+        t = t.replace("पाए", "पाईं")
+        t = t.replace("बताया", "बताई")
+        t = t.replace("सुनाया", "सुनाई")
+        t = t.replace("बनाया", "बनाई")
+        t = t.replace("लाया", "लाई")
+        t = t.replace("सिखाया", "सिखाई")
+        t = t.replace("समझाया", "समझाई")
+        t = t.replace("भेजा", "भेजी")
+        t = t.replace("छोड़ा", "छोड़ी")
+        t = t.replace("छोड़े", "छोड़ीं")
+        t = t.replace("पकड़ा", "पकड़ी")
+        t = t.replace("पढ़ा", "पढ़ी")
+        t = t.replace("देखा", "देखी")
+        t = t.replace("मारा", "मारी")
+        t = t.replace("बुलाया", "बुलाई")
+        t = t.replace("खाया", "खाई")
+        t = t.replace("पिया", "पी")
+        t = t.replace("पहना", "पहनी")
+        t = t.replace("ओढ़ा", "ओढ़ी")
+        t = t.replace("उठाया", "उठाई")
+        t = t.replace("डाला", "डाली")
+        t = t.replace("निकाला", "निकाली")
+        t = t.replace("बचाया", "बचाई")
+        t = t.replace("बुझाया", "बुझाई")
+
+        // ── ि → ी suffix pattern (core feminine marker) ───────────────────────
+        // Masculine adjective/verb suffix 'ा' (aa) → 'ी' (ii) for feminine
+        // Applied selectively to avoid over-replacement
+        t = t.replace("अच्छा", "अच्छी")
+        t = t.replace("बुरा", "बुरी")
+        t = t.replace("बड़ा", "बड़ी")
+        t = t.replace("छोटा", "छोटी")
+        t = t.replace("नया", "नई")
+        t = t.replace("पुराना", "पुरानी")
+        t = t.replace("सुंदर", "सुंदर")   // invariant
+        t = t.replace("काला", "काली")
+        t = t.replace("लाल", "लाल")        // invariant
+        t = t.replace("पीला", "पीली")
+        t = t.replace("हरा", "हरी")
+        t = t.replace("नीला", "नीली")
+        t = t.replace("सफेद", "सफेद")      // invariant
+        t = t.replace("मोटा", "मोटी")
+        t = t.replace("पतला", "पतली")
+        t = t.replace("लंबा", "लंबी")
+        t = t.replace("ऊँचा", "ऊँची")
+        t = t.replace("नीचा", "नीची")
+        t = t.replace("गरम", "गरम")        // invariant
+        t = t.replace("ठंडा", "ठंडी")
+        t = t.replace("भारी", "भारी")       // already fem
+        t = t.replace("हल्का", "हल्की")
+        t = t.replace("मेरा", "मेरी")
+        t = t.replace("तेरा", "तेरी")
+        t = t.replace("हमारा", "हमारी")
+        t = t.replace("तुम्हारा", "तुम्हारी")
+        t = t.replace("उसका", "उसकी")
+        t = t.replace("इसका", "इसकी")
+        t = t.replace("उनका", "उनकी")
+        t = t.replace("इनका", "इनकी")
+        t = t.replace("आपका", "आपकी")
+
+        // ── Adverbs with gender agreement ─────────────────────────────────────
+        t = t.replace("तैयार हुआ", "तैयार हुई")
+        t = t.replace("खुश हुआ", "खुश हुई")
+        t = t.replace("दुखी हुआ", "दुखी हुई")
+        t = t.replace("परेशान हुआ", "परेशान हुई")
+        t = t.replace("थका हुआ", "थकी हुई")
+        t = t.replace("जागा हुआ", "जागी हुई")
+        t = t.replace("सोया हुआ", "सोई हुई")
+        t = t.replace("बैठा हुआ", "बैठी हुई")
+        t = t.replace("खड़ा हुआ", "खड़ी हुई")
+        t = t.replace("लेटा हुआ", "लेटी हुई")
+
+        // ── Continuous (rahi/raha) ─────────────────────────────────────────────
+        t = t.replace("रहा हूँ", "रही हूँ")   // idempotent guard
+        t = t.replace("रहा हूं", "रही हूं")
+
         return t
     }
 }
