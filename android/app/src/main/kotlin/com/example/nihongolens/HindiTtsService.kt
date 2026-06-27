@@ -179,20 +179,19 @@ object HindiTtsService {
                 val item = fetchQueue.take()   // blocks — never misses
                 if (!enabled) continue
 
-                // STALE GUARD: drop sentences waiting >5s
-                // Synthesis takes 2-4s on ARM — 5s budget leaves 1-3s margin
-                // Old 8s was too generous: one 15s synthesis caused all subsequent to be stale
+                // STALE GUARD: drop sentences waiting >15s
+                // With FIFO token display (subtitle shown when TTS plays, not when translation arrives),
+                // synthesis delay is hidden from user — they see subtitle exactly when audio plays.
+                // So we can afford a longer stale window. 15s = allows 1-2 slow syntheses in queue.
                 val ageMs = System.currentTimeMillis() - item.enqMs
-                if (ageMs > 5_000L) {
+                if (ageMs > 15_000L) {
                     CaptionLogger.log(TAG, "TTS-SKIP stale ${ageMs/1000}s '${item.text.take(30)}'")
                     continue
                 }
 
-                // QUEUE OVERLOAD: if even 1 item is still waiting, skip current
-                // and let the more recent one be processed instead.
-                // With 2-4s synthesis time: q>1 means we're already 4-8s behind.
-                // Old q>2 allowed 3 sentences to pile up = 6-12s of backlog.
-                if (fetchQueue.size > 1) {
+                // QUEUE OVERLOAD: if more than 3 items waiting, skip current
+                // With 8-10s synthesis, q>3 = 24-30s of queued content = too old
+                if (fetchQueue.size > 3) {
                     CaptionLogger.log(TAG, "TTS-SKIP overloaded q=${fetchQueue.size+1}, going to latest")
                     continue
                 }
@@ -243,10 +242,17 @@ object HindiTtsService {
                 try {
                     isSpeaking = true
                     CaptionLogger.log(TAG, "PLAY ${item.durMs}ms '${item.text.take(40)}'")
+                    // FIFO TOKEN: Show subtitle exactly when audio starts playing.
+                    // This is the ONLY place where the subtitle overlay is updated.
+                    // Livecaptionreader no longer calls OverlayService.updateText() directly.
                     withContext(Dispatchers.Main) {
                         OverlayService.showTtsText(item.text)
                     }
                     playWav(item.wav, item.durMs)
+                    // Keep subtitle visible after audio ends until next sentence starts.
+                    // clearTtsText() only fades out if nothing is queued — OverlayService
+                    // handles this: if playQueue has next item, showTtsText() will immediately
+                    // replace it without a gap.
                     withContext(Dispatchers.Main) {
                         OverlayService.clearTtsText()
                     }
@@ -272,10 +278,8 @@ object HindiTtsService {
                 conn = URL("$TTS_URL?text=$enc&gender=$gender&speed=$speed&emo=$emoStr")
                     .openConnection() as HttpURLConnection
                 conn.connectTimeout = 3_000
-                // CRITICAL: Server now has 6s synthesis timeout.
-                // readTimeout must be > 6s to receive that 408 response.
-                // 8s gives 2s headroom after the server's 6s synthesis limit.
-                conn.readTimeout    = 8_000
+                // 12s read timeout: server now has 10s synthesis limit + 2s margin
+                conn.readTimeout    = 12_000
                 when (conn.responseCode) {
                     200  -> conn.inputStream.readBytes()
                     503  -> { CaptionLogger.log(TAG, "TTS-BUSY server synthesizing, skip"); null }
