@@ -54,7 +54,7 @@ object GenderAnalyzer {
      * Start internal audio capture for gender detection.
      * Must be called with a valid MediaProjection from SpeechCaptureService.
      */
-    fun start(projection: MediaProjection? = null) {
+    fun start(projection: MediaProjection? = null, context: android.content.Context? = null) {
         if (enabled) {
             CaptionLogger.log(TAG, "already running — skipping start()")
             return
