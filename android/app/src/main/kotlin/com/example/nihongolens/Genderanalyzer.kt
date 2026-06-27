@@ -234,6 +234,16 @@ object GenderAnalyzer {
         }
     }
 
+    // ── Emotion detection state ───────────────────────────────────────────────
+    private val f0History   = ArrayDeque<Float>(16)   // recent F0 values for variation
+    private val rmsHistory  = ArrayDeque<Float>(16)   // recent RMS for energy analysis
+    private var prevF0      = 0f
+    private var risingFrames = 0
+    private var fallingFrames = 0
+    private var highEnergyFrames = 0
+    private var sustainedHighF0Frames = 0
+    private var emotionFrameCount = 0
+
     private fun onPitch(f0: Float, rms: Float) {
         frameCount++
         val gender = if (f0 >= F0_FEMALE) HindiTtsService.Gender.FEMALE
@@ -256,5 +266,89 @@ object GenderAnalyzer {
             CaptionLogger.log(TAG, ">>> Gender SWITCHED to $maj F0=${f0.toInt()}Hz <<<")
             Log.d(TAG, "Gender→$maj F0=${f0.toInt()} rms=${rms.toInt()}")
         }
+
+        // ── FIX BUG 3: Emotion detection from acoustic features ──────────────
+        // Track F0 contour and energy to detect emotion every 10 frames (~640ms)
+        f0History.addLast(f0)
+        rmsHistory.addLast(rms)
+        if (f0History.size > 12) f0History.removeFirst()
+        if (rmsHistory.size > 12) rmsHistory.removeFirst()
+
+        // F0 slope: rising = excited/happy/surprised, falling = sad/sighing
+        val f0Slope = if (prevF0 > 0) f0 - prevF0 else 0f
+        prevF0 = f0
+        if (f0Slope > 5f) risingFrames++ else if (f0Slope < -5f) fallingFrames++
+
+        // High energy = excited/angry
+        val baseRms = rmsHistory.average().toFloat()
+        if (rms > baseRms * 1.5f) highEnergyFrames++
+
+        // Sustained high F0 = singing or excited
+        if (f0 > 250f) sustainedHighF0Frames++ else sustainedHighF0Frames = 0
+
+        emotionFrameCount++
+
+        if (emotionFrameCount >= 10) {
+            emotionFrameCount = 0
+            val detectedEmotion = detectEmotionFromAcoustics(
+                f0History.toList(), rmsHistory.toList(),
+                risingFrames, fallingFrames, highEnergyFrames, sustainedHighF0Frames, f0
+            )
+            if (detectedEmotion != HindiTtsService.currentEmotion) {
+                HindiTtsService.currentEmotion = detectedEmotion
+                CaptionLogger.log(TAG, "EMO→$detectedEmotion F0=${f0.toInt()} slope=${f0Slope.toInt()}")
+            }
+            risingFrames = 0; fallingFrames = 0; highEnergyFrames = 0
+        }
     }
+
+    private fun detectEmotionFromAcoustics(
+        f0s: List<Float>, rmss: List<Float>,
+        rising: Int, falling: Int, highEnergy: Int,
+        sustainedHigh: Int, currentF0: Float
+    ): HindiTtsService.Emotion {
+        val f0Mean   = f0s.average().toFloat()
+        val f0Std    = f0s.map { (it - f0Mean) * (it - f0Mean) }.average().let { Math.sqrt(it).toFloat() }
+        val rmsMean  = rmss.average().toFloat()
+        val rmsStd   = rmss.map { (it - rmsStd(rmss)) * (it - rmsStd(rmss)) }.average().let { Math.sqrt(it).toFloat() }
+
+        // Singing: sustained high F0 (>250Hz) for 5+ frames
+        if (sustainedHigh >= 5 && f0Std < 30f) return HindiTtsService.Emotion.SINGING
+
+        // Excited/happy: rising F0, high energy, fast
+        if (rising >= 5 && highEnergy >= 3 && f0Mean > 200f)
+            return HindiTtsService.Emotion.EXCITED
+        if (rising >= 4 && f0Mean > 180f)
+            return HindiTtsService.Emotion.HAPPY
+
+        // Surprised: sudden high F0 spike
+        if (currentF0 > 280f && f0Std > 40f)
+            return HindiTtsService.Emotion.SURPRISED
+
+        // Fearful: high F0, fast variation, moderate energy
+        if (f0Mean > 220f && f0Std > 30f && highEnergy < 3)
+            return HindiTtsService.Emotion.FEARFUL
+
+        // Angry: high energy, falling or variable pitch
+        if (highEnergy >= 5 && f0Std > 25f)
+            return HindiTtsService.Emotion.ANGRY
+
+        // Sad/sighing: falling F0, low energy, slow
+        if (falling >= 6 && rmsMean < 800f)
+            return HindiTtsService.Emotion.SIGHING
+        if (falling >= 4 && f0Mean < 130f)
+            return HindiTtsService.Emotion.SAD
+
+        // Warm: smooth stable mid F0, calm energy
+        if (f0Std < 15f && f0Mean in 120f..180f && highEnergy < 2)
+            return HindiTtsService.Emotion.WARM
+
+        // Whispery: very low RMS
+        if (rmsMean < 300f && f0Std < 20f)
+            return HindiTtsService.Emotion.WHISPERY
+
+        return HindiTtsService.Emotion.NEUTRAL
+    }
+
+    private fun rmsStd(rmss: List<Float>): Float = rmss.average().toFloat()
 }
