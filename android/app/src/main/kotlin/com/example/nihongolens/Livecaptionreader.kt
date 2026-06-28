@@ -302,7 +302,9 @@ class LiveCaptionReader : AccessibilityService() {
                 HindiTtsService.stopAndClear()
                 sentenceTimerJob?.cancel(); sentenceTimerJob = null
                 sentenceBuffer = ""; lastBufferEnqueued = ""; lastEnqueuedWordCount = 0
-                lastEnqueuedText = ""; lastSubmitTotalWords = 0; lastSubmitMs = 0L; lastForcedMs = 0L
+                lastEnqueuedText = ""; lastSubmitTotalWords = 0; lastSubmitMs = 0L
+                // Keep lastForcedMs — prevents immediate FORCE when next speaker appears
+                // (FORCE_COOLDOWN_MS=5s still applies across LC gone/appear transitions)
             }
             return null
         }
@@ -649,20 +651,30 @@ class LiveCaptionReader : AccessibilityService() {
             // Prevents W1 and W2 both spending 5s on the same sentence.
             val alreadyRunning = !activeTranslations.add(nText)  // atomic add; returns false if already present
             if (alreadyRunning) {
-                CaptionLogger.log(TAG, "DEDUP[$name] $seq already translating same text")
-                // Wait for cache to be populated by the other worker
+                CaptionLogger.log(TAG, "DEDUP[$name] $seq — waiting for other worker's result")
+                // Wait up to 9s for the other worker to populate cache
+                // If W1 hits CT2 timeout (8s), cache stays empty → W2 SKIPS (not retries)
+                // Previously: W2 would fall through to callServer → double CT2 timeout = 16s blocked
                 var waited = 0
-                while (waited < 6000) {
-                    delay(100); waited += 100
+                var gotResult = false
+                while (waited < 9_000) {
+                    delay(200); waited += 200
                     val cached2 = synchronized(translationCache) { translationCache[nText] }
                     if (cached2 != null) {
-                        CaptionLogger.log(TAG, "DEDUP-HIT[$name] $seq got cached result")
+                        CaptionLogger.log(TAG, "DEDUP-HIT[$name] ${waited}ms '${cached2.take(30)}'")
                         deliverHindi(seq, text, cached2, name, waited.toLong())
+                        gotResult = true
+                        break
+                    }
+                    // If other worker finished (no longer active) and cache still empty → it failed
+                    if (!activeTranslations.contains(nText)) {
+                        CaptionLogger.log(TAG, "DEDUP-SKIP[$name] other worker failed, skipping")
                         break
                     }
                 }
-                activeTranslations.remove(nText)
-                continue
+                if (!gotResult)
+                    CaptionLogger.log(TAG, "DEDUP-SKIP[$name] ${waited}ms no result, moving on")
+                continue  // always skip — never retry with callServer
             }
 
             val result = callServer(text)
