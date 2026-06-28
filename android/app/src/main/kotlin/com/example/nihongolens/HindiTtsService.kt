@@ -9,6 +9,8 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 import java.util.Locale
 import java.util.UUID
@@ -85,6 +87,14 @@ object HindiTtsService {
     @Volatile private var voiceMale:   android.speech.tts.Voice? = null
 
     // Pending utterance callbacks: utteranceId → resumption function
+    // Mutex: Android TTS synthesizeToFile is NOT thread-safe when called concurrently
+    // on the same TextToSpeech object. Two workers calling it simultaneously causes:
+    //   - Wrong pitch/voice applied (F2 sets voice=male while F1 is synthesizing female)  
+    //   - CompletableDeferred callback mismatch (F2 completion triggers F1's deferred)
+    //   - Silent failure: synthesizeToFile returns SUCCESS but produces empty WAV
+    // Mutex ensures only ONE synthesis at a time. Workers can still fetch/decode in parallel.
+    private val synthesizeMutex = Mutex()
+
     private val pendingUtterances = ConcurrentHashMap<String, () -> Unit>()
 
     // ── FIFO queues ───────────────────────────────────────────────────────────
@@ -383,7 +393,8 @@ object HindiTtsService {
     // ── Android TTS synthesize to file (async with coroutine bridge) ──────────
 
     private suspend fun synthesizeToFile(item: FetchItem): File? =
-        withContext(Dispatchers.IO) {
+        synthesizeMutex.withLock {
+            withContext(Dispatchers.IO) {
             val localTts = tts ?: return@withContext null
             val outFile = File(cacheDir, "tts_${UUID.randomUUID()}.wav")
 
@@ -445,7 +456,7 @@ object HindiTtsService {
                 CaptionLogger.log(TAG, "TTS-EXC ${e.message}")
                 null
             }
-        }
+        } } // end withContext + synthesizeMutex.withLock
 
     // ── Play worker: WAV → AudioTrack ─────────────────────────────────────────
 
