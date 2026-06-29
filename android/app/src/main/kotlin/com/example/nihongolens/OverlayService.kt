@@ -80,6 +80,7 @@ class OverlayService : Service() {
             }
         }
         fun clearQueue() {
+            CaptionLogger.log("Overlay", "clearQueue() called", CaptionLogger.Level.WARN)
             instance?.handler?.post { instance?.onClear() }
         }
         fun setHoldMs(ms: Long) {
@@ -245,9 +246,13 @@ class OverlayService : Service() {
     }
 
     private fun fadeOut() {
+        CaptionLogger.onOverlayFadeOut("silence_timer")
         textView?.animate()?.cancel()
         textView?.animate()?.alpha(0f)?.setDuration(250)
-            ?.withEndAction { textView?.text = "" }?.start()
+            ?.withEndAction {
+                textView?.text = ""
+                CaptionLogger.onOverlayGone("fade_complete")
+            }?.start()
     }
 
     private fun cancelTimers() {
